@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tag matches wally.toml
+        run: |
+          version=$(grep -m1 '^version' wally.toml | cut -d '"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match wally.toml version $version"
+            exit 1
+          fi
+
+      - uses: CompeyDev/setup-rokit@v0.2.1
+
+      - name: Build model
+        run: rojo build build.project.json -o BitNet.rbxm
+
+      - name: Create release
+        run: gh release create "$GITHUB_REF_NAME" BitNet.rbxm --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

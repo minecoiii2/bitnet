@@ -1,11 +1,12 @@
 [package]
 name = "raph/bitnet"
-description = "Buffer-based networking library for Roblox"
+description = "Super-fast buffer-based networking library for Roblox"
 version = "3.0.0"
 license = "MIT"
 authors = ["Raph"]
 realm = "shared"
 registry = "https://github.com/UpliftGames/wally-index"
-exclude = ["rokit.toml"]
+repository = "https://github.com/minecoiii2/bitnet"
+exclude = ["rokit.toml", "build.project.json", ".github"]
 
 [dependencies]

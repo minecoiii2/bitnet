@@ -1,173 +1,151 @@
-# Bitnet
+# BitNet
 
-Buffer-based networking library for Roblox. Replaces RemoteEvent/RemoteFunction with batched, type-checked wire frames over two shared remotes, using a main buffer plus refs and packed-boolean side channels.
+Buffer-based networking library for Roblox. Replaces RemoteEvents and RemoteFunctions with typed, batched events and funcs that all run over two shared remotes.
 
-## Module layout
-ReplicatedStorage.BitNet              -- main module, exports { types, event, func, signal }
-├── codec                             -- type primitives + combinators
-├── bin                               -- per-bin buffer, refs and boolean state; grow/retry, bool packing, snapshots
-├── binaries                          -- global + per-player bins, dirty tracking
-├── constants                         -- MAX_UNRELIABLE_BYTES, DEFAULT_FUNC_TIMEOUT, etc.
-├── instances/
-│   ├── event                         -- event.new
-│   ├── func                          -- func.new
-│   └── signal                        -- signal.new (recycled runner thread, optional pre-connect queue)
-├── runtime/
-│   ├── registry                      -- sequential id minting, frame headers, rate limiting
-│   ├── remotes                       -- BitnetReliable + BitnetUnreliable
-│   └── dispatch                      -- Heartbeat send loop + receive parser
-├── libs/
-│   ├── hash                          -- FNV-1a u32
-│   ├── assertAt                      -- error at user-specified stack level
-│   └── getNearbyPlayers              -- players within range, for streamed fires
-└── types                             -- Luau type definitions (Bitnet, BitnetTypes, ServerEvent, ServerFunction)
+- Every fire in a frame is packed into one buffer per player and sent once per Heartbeat
+- Schemas describe the payload, so data goes out as tightly packed bytes instead of Lua tables
+- Booleans cost one bit, Instances cost no buffer space
+- Reliable and unreliable events, two-way funcs, rate limiting and runtime typechecking
 
-## Public API
+## Installation
 
-### Top-level exports
+**Wally**
+```toml
+[dependencies]
+BitNet = "raph/bitnet@3.0.0"
+```
 
-| Field        | Description                                                                 |
-| ------------ | --------------------------------------------------------------------------- |
-| `types`      | Table of all type primitives and combinators.                               |
-| `event(opts)`| Creates a new event. Returns a `ServerEvent<A...>`.                         |
-| `func(opts)` | Creates a new function. Returns a `ServerFunction<A..., R...>`.             |
-| `signal()`   | Creates a standalone Signal (local pub-sub, not networked).                 |
+**Manual:** download `BitNet.rbxm` from [Releases](https://github.com/minecoiii2/bitnet/releases) and insert it into `ReplicatedStorage`.
 
-### Types
+## Quick start
+
+Define everything in one shared module that both the server and client require:
+
+```lua
+-- ReplicatedStorage/Net.luau
+const bitnet = require(game.ReplicatedStorage.Packages.BitNet)
+const t = bitnet.types
+
+return {
+	Chat = bitnet.event({
+		Args = t.tuple(t.string, t.u8),
+	}),
+	Hit = bitnet.event({
+		Args = t.struct({ target = t.instance, damage = t.u16 }),
+		Reliable = false,
+		RateLimit = { calls = 20, per = 1 },
+	}),
+	GetPrice = bitnet.func({
+		Args = t.string,
+		Returns = t.u32,
+	}),
+}
+```
+
+```lua
+-- Server
+Net.Chat.OnServerEvent:Connect(function(player, message, channel)
+	Net.Chat:FireAllClients(message, channel)
+end)
+
+Net.GetPrice:SetCallback(function(player, itemId)
+	return 100
+end)
+```
+
+```lua
+-- Client
+Net.Chat.OnClientEvent:Connect(function(message, channel)
+	print(message)
+end)
+
+Net.Chat:FireServer("hello", 1)
+const price = Net.GetPrice:InvokeServer("sword")
+```
+
+## Types
 
 | Type | Bytes | Notes |
 | ---- | ----- | ----- |
-| `u8` `u16` `u24` `u32` | 1 2 3 4 | Unsigned integers. |
-| `i8` `i16` `i24` `i32` | 1 2 3 4 | Signed integers. |
-| `f24` `f32` `f64` | 3 4 8 | `f24` is an f32 with the low 8 mantissa bits dropped, by truncation, so its relative error reaches 3e-5 and is biased toward zero. `number` aliases `f64`. |
-| `bool` | 0 | One bit in the boolean side channel. |
-| `string` `buffer` | 1-5 + len | Varint byte-length prefix: one byte through 127, five through the u32 max. |
-| `uuid` | 16 | Canonical lowercase unbraced 36-char form only; `check` rejects anything else. |
-| `vec2` `vec3` | 8 12 | f32 per axis. |
-| `vec2i16(scale?)` `vec3i16(scale?)` | 4 6 | Fixed point, i16 count of `1/scale` studs. Default scale 100, so ±327 studs. |
-| `color3` | 3 | u8 RGB. |
-| `cframe` | 18 | f32 position, u16 orientation angles. |
-| `cframelong` | 24 | f32 position and f32 orientation angles. |
-| `brickcolor` | 2 | `BrickColor.Number`. |
-| `numberrange` | 8 | Two f32. |
-| `udim` `udim2` | 4 8 | i16 Scale thousandths + i16 Offset per axis. Scale ±32.767, Offset ±32767. |
-| `numbersequence` | 1 + 4n or 1 + 12n | Compact or full per value; one bit in the boolean channel says which. |
-| `colorsequence` | 1 + 7n | u8 count, then f32 Time and a u8 RGB triple. Max 255 keypoints. |
-| `nothing` | 0 | Always nil. |
-| `ref` `instance` `unknown` | 0 | Ride the refs side channel and accept nil. `ref` carries any value a RemoteEvent can; `instance` only Instances, and one the receiver can't see (streamed out, server-only) arrives as nil. `unknown` aliases `ref`. |
-| `any` | 1 + payload | Tagged dynamic value, see Gotchas. |
+| `u8` `u16` `u24` `u32` | 1–4 | Unsigned integers |
+| `i8` `i16` `i24` `i32` | 1–4 | Signed integers |
+| `f24` `f32` `f64` | 3, 4, 8 | `number` is `f64`. `f24` is lossy (~3e-5 relative error) |
+| `bool` | 1 bit | Packed eight to a byte |
+| `string` `buffer` | 1–5 + length | |
+| `uuid` | 16 | Canonical 36-character lowercase form |
+| `vec2` `vec3` | 8, 12 | |
+| `vec2i16(scale?)` `vec3i16(scale?)` | 4, 6 | Fixed point, ±327 studs at the default scale of 100 |
+| `cframe` `cframelong` | 18, 24 | `cframe` uses 16-bit rotation angles |
+| `color3` | 3 | 8 bits per channel |
+| `brickcolor` `numberrange` `udim` `udim2` | 2, 8, 4, 8 | |
+| `numbersequence` `colorsequence` | varies | |
+| `instance` `ref` `unknown` | 0 | Sent next to the buffer as normal Roblox values |
+| `any` | 1 + value | Picks an encoding at runtime |
+| `nothing` | 0 | Always nil |
 
-The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes: buffer reads and writes cost the same at every width, so narrowing only ever adds work. Reach for them when bandwidth is the binding constraint, not by default.
+The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) save bytes but cost a bit of CPU. Use them when bandwidth matters.
 
-**Combinators:**
-- `struct(format)` — keyed table. Fields are hash-sorted, so source order does not matter.
-- `array(value)` — sequential array, varint count.
-- `map(key, value)` — k/v table. Count is backfilled after the entries, so it is capped at 16,383.
-- `optional(value)` — nullable. Presence is a bit in the boolean channel; a nil writes nothing to the main buffer.
-- `tuple(...)` — variadic.
-- `enum(enumObject)` — Roblox EnumItem, e.g. `enum(Enum.KeyCode)`. 1, 2 or 4 bytes by the enum's largest value. Lookup tables are built once per Enum and shared.
-- `enumFromKeys(t)` / `enumFromValues(t)` — interned string enums over a known set, 1, 2 or 4 bytes by symbol count. Interns the table's keys or its values respectively; both sort lexicographically, so the two are interchangeable for the same set. Strings only, closed once compiled, cached per source table.
-- `compress(value, level?)` — Zstd-wraps any type, emitting whichever of the raw and compressed forms is smaller, so it can never inflate the wire. `level` defaults to -2; under 128 bytes stays raw.
+**Combinators**
+- `struct(format)`: table with fixed keys
+- `array(value)`: array of one type
+- `map(key, value)`: dictionary, up to 16,383 entries
+- `optional(value)`: value or nil
+- `tuple(...)`: multiple arguments
+- `enum(Enum.X)`: a Roblox EnumItem
+- `enumFromKeys(t)` / `enumFromValues(t)`: string from a known set, sent as an index
+- `compress(value, level?)`: Zstd-compresses the value when that makes it smaller
 
-### Events
+## Events
 
-`event(options)` where options is:
+`bitnet.event(options)`
 
-| Field       | Type                              | Default | Description                                    |
-| ----------- | --------------------------------- | ------- | ---------------------------------------------- |
-| `Args`      | compiled type                     | required | Schema for the payload.                       |
-| `Reliable`  | `boolean?`                        | `true`  | Reliable or unreliable channel.                |
-| `Typecheck` | `boolean?`                        | `IS_STUDIO` | Runtime structural validation before send. |
-| `RateLimit` | `{calls: number, per: number}?`   | nil     | Server-side gate on incoming client fires.     |
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `Args` | required | Payload type |
+| `Reliable` | `true` | Use the reliable or unreliable channel |
+| `Typecheck` | Studio only | Validate payloads before sending |
+| `RateLimit` | none | `{ calls, per }` limit on fires from each client |
 
-**Methods:**
-- `:FireServer(...)` — client → server
-- `:FireClient(player, ...)` — server → one client
-- `:FireAllClients(...)` — server → all clients
-- `:FireClientsStreamed(at, range, ...)` / `:FireClientsStreamedWithExclusion(at, range, exclude, ...)` — server → players whose HumanoidRootPart is within `range` of `at`
-- `.OnReceived` — Signal fired with `(player, ...payload)` on the server and `(...payload)` on the client. `.OnServerEvent` and `.OnClientEvent` are the same signal under other names.
+**Methods:** `:FireServer(...)`, `:FireClient(player, ...)`, `:FireAllClients(...)`, `:FireClientsStreamed(position, range, ...)`, `:FireClientsStreamedWithExclusion(position, range, player, ...)`
 
-**Client events buffer until someone listens.** Fires arriving before the first handler connects are queued, then drained on the next defer to whatever is connected at that moment. After that the queue is gone for good and fires with no handler are dropped, as they always are on the server. A `:Once` or `:Wait` as the first listener takes the oldest buffered fire and the rest of the backlog is dropped.
+**Listening:** `.OnServerEvent` gives `(player, ...)` and `.OnClientEvent` gives `(...)`. `.OnReceived` is the same signal under another name.
 
-### Funcs
+On the client, fires that arrive before anything is connected are queued and delivered to the first listener.
 
-`func(options)`:
+## Funcs
 
-| Field       | Type                              | Default | Description                                    |
-| ----------- | --------------------------------- | ------- | ---------------------------------------------- |
-| `Args`      | compiled type                     | required | Schema for the request payload.               |
-| `Returns`   | compiled type                     | required | Schema for the response payload.               |
-| `Timeout`   | `number?`                         | `7`     | Seconds to wait for response before erroring. `math.huge` or `0` waits forever. |
-| `Typecheck` | `boolean?`                        | `IS_STUDIO` | Runtime structural validation.             |
-| `RateLimit` | `{calls: number, per: number}?`   | nil     | Server-side gate on incoming invokes.          |
+`bitnet.func(options)`
 
-**Methods:**
-- `:InvokeServer(...)` — called on the client. Yields until the response or the timeout; raises on either failure.
-- `:InvokeClient(player, ...)` — called on the server. Same yielding contract.
-- `:SetCallback(fn)` — set on whichever side *answers*. Both sides may set one, since either can be invoked: the server's callback receives `(player, ...args) -> ...returns`, the client's receives `(...args) -> ...returns` with no player argument.
-- `:SetServerCallback(fn)` / `:SetClientCallback(fn)` — the same, but raise if called on the wrong side.
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `Args` | required | Request type |
+| `Returns` | required | Response type |
+| `Timeout` | `7` | Seconds before the invoke errors. `0` or `math.huge` waits forever |
+| `Typecheck` | Studio only | Validate payloads before sending |
+| `RateLimit` | none | `{ calls, per }` limit on invokes from each client |
 
-**Every func works in both directions.** Each frame carries a u16 word whose top bit says request or response, leaving a 15-bit request id. That is what lets both directions be in flight on the same func at once without their ids colliding — 32,767 outstanding per side. Funcs are always reliable.
+**Methods:** `:InvokeServer(...)`, `:InvokeClient(player, ...)`, `:SetCallback(fn)`, plus `:SetServerCallback(fn)` and `:SetClientCallback(fn)`, which error when called on the wrong side.
 
-**Invoking a client is hostile ground**, because the client decides whether an answer ever comes back. Three things make it survivable, and they are load-bearing rather than polish:
-- `:InvokeClient` **requires a finite positive `Timeout`** and raises without one, since an untimed invoke would park a server thread and leak its pending entry for as long as the server runs. `:InvokeServer` carries no such requirement, so an untimed func stays legal as long as nothing invokes a client with it.
-- Each player may hold at most `MAX_PENDING_PER_PLAYER` outstanding invokes; past that `:InvokeClient` raises rather than letting one stalling client accumulate server threads.
-- A response is only accepted from the player the request was sent to, so one player cannot answer another's invoke. A player leaving fails their pending invokes immediately instead of making the server wait out the timeout.
+Funcs work in both directions and are always reliable. Invoking a client has some safety rules built in:
+- `:InvokeClient` requires a finite `Timeout`
+- A player can have at most 32 pending invokes
+- Only the invoked player can answer, and pending invokes fail as soon as that player leaves
 
-A client with no callback, or whose callback errors, simply lets the invoke time out. There is no distinct error response on the wire; the second free reqid bit is where one would go.
+## Signal
 
-### Signal
-
-`signal()` returns a `Signal<T...>`:
-
-- `:Fire(...)`
-- `:Connect(fn, ...)` → `Connection`. Extra arguments are bound and passed before the fired ones.
-- `:Once(fn, ...)` → `Connection`
-- `:Wait()` → `...`
-- `:DisconnectAll()` — disconnects every handler; each can still `:Reconnect()`.
-- `:Destroy()` — disconnects and releases every handler.
-
-Connection: `.Connected`, `:Disconnect()`, `:Reconnect()`, `:Destroy()`. Only `:Destroy()` is final.
-
-Handlers run on a recycled runner thread, newest connection first.
-
-## How it works
-
-- **Framing.** Each fire writes `[id][payload]` into a bin. `runtime.registry` mints IDs sequentially in registration order, up to 65,535. Under 255 endpoints they are one byte, otherwise varint. The format locks on first network use, so everything must register before any fire.
-- **Batching.** All fires within one Heartbeat coalesce into one RemoteEvent fire per (channel, target), over two shared remotes. On the server a bin joins a dirty list when its cursor leaves 0; the client checks its two global bins directly.
-- **Three channels per send.** The main buffer is argument 1, the refs array argument 2, the packed boolean buffer argument 3.
-- **Refs channel.** Instances and `ref` values ride as real Lua values and take no bytes in the main buffer. Writers append in order, readers consume in the same order, counted by `refCount`. Nil is stored as `false` so the array never has holes; an `instance` can't be `false`, while a falsy `ref` spends one boolean-channel bit telling nil from false.
-- **Tuple fast path.** Events whose `Args` is a tuple of 2 to 6 values fire and receive them as plain arguments, with no packed table on either side. Larger tuples pack into a table. Funcs always pack.
-- **Dispatch.** Every entry exposes one prebuilt `_handle(buf, cursor, context, player)`; `runtime.dispatch` just calls it, with one pcall per batch.
-- **Streamed fires.** Validated and encoded once into a scratch bin, then copied into each nearby player's bin.
-- **Unreliable chunking.** Combined main, boolean and ref payloads exceeding `MAX_UNRELIABLE_BYTES` split on fire boundaries into multiple sends. Refs count against the cap at `UNRELIABLE_REF_BYTES` each, and each chunk carries only its own refs. A single fire over the cap is dropped with a warning.
-- **Boolean channel.** Booleans, `optional` presence flags and the `numbersequence` selector pack eight to a byte through a rolling sentinel, without `buffer.writebits`. Packed bytes stay Lua numbers while batching and are written into one exact-size buffer at send time.
-- **Reliable bins pack bits across fires; unreliable bins do not.** On a reliable bin the sentinel runs continuously through the whole batch and the last partial byte is packed once, in `dispatch.sendBin`, so twenty frames carrying one boolean each cost 3 bytes rather than 20. Unreliable bins flush per fire, because chunk splits slice the boolean buffer by byte index and so must land on a byte boundary; streamed fires force a boundary for the same reason. The reader mirrors this with a `resetBools` flag on `dispatch.processBatch`, true only for unreliable batches.
-- **Codec context.** Every read/write receives the active bin state: `refs`, `refCount`, `bools`, `amount` and `value`. `amount` counts completed boolean bytes, `value` is the rolling sentinel holding the partial byte and its bit count. `Bin.flushBools` packs the sentinel into `bools[]` and empties it. Because a reliable sentinel may hold bits from earlier frames, `Bin.tryWrite` captures it on entry and restores it on retry. Outgoing state is reused per bin; incoming batches own independent state, so yielding handlers cannot interfere.
-- **Sizing.** Fixed-size schemas carry `size`, variable ones carry `sizeOf`. Schemas whose `sizeOf` has to walk the payload (map, `any`, arrays of variable elements, anything containing them) are flagged `_costly` and write optimistically through `Bin.tryWrite`, growing and retrying, instead of being sized first.
-- **Length prefixes.** Shared varint helpers at the top of `codec`, used by string, buffer, array and `any`; call sites inline the one-byte case. Map counts are backfilled after the entries, so they use a padded two-byte varint.
-- **Hybrid encodings.** `numbersequence` spends one boolean-channel bit choosing between a compact form (Time u16/65535, Value and Envelope u8/255, 4 bytes a keypoint) and a full form (three f32, 12 bytes). Compact requires every Value and Envelope in 0..1 and strictly increasing quantised times, since `NumberSequence.new` rejects duplicates. The write fetches `v.Keypoints` once and decides while writing, because that property rebuilds a Lua table on every access.
-- **`compress` internals.** The compressed flag is the low bit of the length prefix rather than a boolean-channel bit, because it is only known after the inner value is written and the reader needs it before decoding. Booleans, optionals and refs inside the wrapped type still ride the real side channels, so only main-buffer bytes are compressed. `sizeOf` returns an upper bound, and the type is `_costly`. A wrapped tuple keeps its arity but loses the spread fast path.
+`bitnet.signal()` creates a local signal that isn't networked. It has `:Fire`, `:Connect`, `:Once`, `:Wait`, `:DisconnectAll` and `:Destroy`. Connections have `:Disconnect`, `:Reconnect` and `:Destroy`.
 
 ## Gotchas
 
-- **Registration order must match on both sides.** IDs are positional, so a divergence misroutes silently with no error. Keep every definition in one shared module that both sides require; `ReplicatedStorage.Networking` is that module.
-- **Interned enums must be compiled from the same symbol set on both sides.** Index N means the Nth lexicographically sorted symbol *on that machine*, so a mismatch decodes a different symbol with no error. Keep the source table in ReplicatedStorage, literal and not built conditionally. Each compiled enum exposes `_fingerprint` (FNV-1a over the sorted set) for hand comparison, at no wire cost.
-- **`array` cannot hold nils.** `#value` on a table with holes is undefined, so `array(optional(x))` silently truncates. Use a struct or a sentinel value instead.
-- **`udim`, `udim2` and `vec*i16` wrap silently out of range**, since `writei16` does not complain. `check` is what catches it, so keep `Typecheck` on or bound the values yourself.
-- **`compress` costs a flat ~25 microseconds per decompress regardless of size, paid per fire rather than per batch**, against 50-1000 ns to decode a whole frame. Wrap large redundant payloads only, never scalars. Narrowing the types first is usually the bigger win and the two stack.
-- **Every type stays inside the size it declares**, `f24` included. It routes the f32 through a module-level scratch buffer instead of writing in place and sliding the bytes down; both measure the same, but the in-place form ran one byte past the field and forced every buffer sized from `size`/`sizeOf` to know about it. `bin.SLACK` and the spare byte in `compress` are kept as a margin now, not a requirement. `Bin.reserve` still copies the whole old buffer, slack included, so anything living there survives a grow — copying only `size` bytes once silently zeroed a real payload byte.
-- **`types.any` picks default encodings.** It covers nil, bool, number, string, vec2/3, color3, cframe, buffer, Instance (via ref), BrickColor, NumberRange, UDim, UDim2, NumberSequence, ColorSequence, array, map and `table.pack`-shaped tuples; functions and threads error. A CFrame inside `any` is the 18-byte `cframe` and a uuid is just a string, so name the type to get the narrow form.
-- **Typecheck defaults on in Studio, off in production** (`constants.DEFAULT_TYPECHECK`).
+- **Register in the same order on both sides.** IDs are assigned in registration order, and a mismatch sends data to the wrong handler without any error. Put every definition in one shared module and create them all before the first fire.
+- **`enumFromKeys` and `enumFromValues` need the same set on both sides.** Keep the source table in ReplicatedStorage, written out literally.
+- **`array` can't hold nil.** `array(optional(x))` gets cut off at the first nil.
+- **`udim`, `udim2` and `vec*i16` wrap around when out of range.** Only `Typecheck` catches it.
+- **Unreliable fires over 1,000 bytes are dropped** with a warning.
+- **`compress` costs about 25µs per fire to decompress.** Only use it on large, repetitive payloads.
+- **`any` picks default encodings**, so a CFrame inside `any` is sent as `cframe`. Name the type yourself when you need a specific one.
+- **`Typecheck` is on in Studio and off in live servers** unless you set it.
 
-## Constants (`Bitnet.constants`)
+## License
 
-| Name                    | Default | Purpose                                          |
-| ----------------------- | ------- | ------------------------------------------------ |
-| `MAX_UNRELIABLE_BYTES`  | 1,000   | Combined main + boolean + ref unreliable chunk cap. |
-| `UNRELIABLE_REF_BYTES`  | 8       | Assumed wire cost of one ref, for that cap.      |
-| `DEFAULT_FUNC_TIMEOUT`  | 7       | Default `Timeout` for funcs.                     |
-| `MAX_PENDING_PER_PLAYER`| 32      | Outstanding `:InvokeClient` calls allowed per player. |
-| `DEFAULT_TYPECHECK`     | IS_STUDIO | Default `Typecheck` for events and funcs.      |
-| `DEFAULT_BIN_SIZE`      | 256     | Starting bin buffer size in bytes.               |
-| `BIN_GROWTH_FACTOR`     | 2       | Buffer grow multiplier on overflow.              |
+MIT

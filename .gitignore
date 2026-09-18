@@ -3,6 +3,7 @@ ServerPackages/
 DevPackages/
 wally.lock
 sourcemap.json
+how-to-release.txt
 
 *.rbxm
 *.rbxmx
