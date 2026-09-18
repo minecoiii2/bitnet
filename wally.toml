@@ -1,6 +1,6 @@
 [package]
 name = "minecoiii2/bitnet"
-description = "Super-fast buffer-based networking library for Roblox"
+description = "Lightning-fast buffer-based networking library for Roblox"
 version = "3.0.1"
 license = "MIT"
 authors = ["Raph"]
