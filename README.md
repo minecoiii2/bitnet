@@ -9,58 +9,64 @@ Buffer-based networking library for Roblox. Replaces RemoteEvents and RemoteFunc
 
 ## Installation
 
+BitNet comes with **Networking**, a template module where you define all of your events and funcs.
+
+**Manual:** download `BitNet.rbxm` and `Networking.rbxm` from [Releases](https://github.com/minecoiii2/bitnet/releases) and insert both into `ReplicatedStorage`.
+
 **Wally**
 ```toml
 [dependencies]
 BitNet = "minecoiii2/bitnet@3.0.0"
 ```
-
-**Manual:** download `BitNet.rbxm` from [Releases](https://github.com/minecoiii2/bitnet/releases) and insert it into `ReplicatedStorage`.
+Then copy [`Networking.luau`](Networking.luau) into your project and change its require to point at your packages folder, e.g. `ReplicatedStorage.Packages.BitNet`.
 
 ## Quick start
 
-Define everything in one shared module that both the server and client require:
+Every event and func goes in the table that `Networking` returns. The server and client both require this one module, so everything registers in the same order on both sides.
 
 ```lua
--- ReplicatedStorage/Net.luau
-const bitnet = require(game.ReplicatedStorage.Packages.BitNet)
-const t = bitnet.types
-
+-- ReplicatedStorage.Networking
 return {
-	Chat = bitnet.event({
-		Args = t.tuple(t.string, t.u8),
+	Chat = RemoteEvent({
+		Args = args(string, u8),
 	}),
-	Hit = bitnet.event({
-		Args = t.struct({ target = t.instance, damage = t.u16 }),
+	Hit = RemoteEvent({
+		Args = struct({ target = Instance, damage = u16 }),
 		Reliable = false,
-		RateLimit = { calls = 20, per = 1 },
+		RateLimit = BuildRatelimit(20, 1),
 	}),
-	GetPrice = bitnet.func({
-		Args = t.string,
-		Returns = t.u32,
+	GetPrice = RemoteFunction({
+		Args = string,
+		Returns = u32,
 	}),
 }
 ```
 
+The template sets up short names for everything at the top: `RemoteEvent` is `BitNet.event`, `RemoteFunction` is `BitNet.func`, `args` is `tuple`, and the types are named after their Roblox equivalents (`Vector3`, `CFrame`, `Instance`, ...). Two names differ from the table below: `any` is `ref`, and `auto` is BitNet's `any`.
+
 ```lua
 -- Server
-Net.Chat.OnServerEvent:Connect(function(player, message, channel)
-	Net.Chat:FireAllClients(message, channel)
+const Networking = require(ReplicatedStorage.Networking)
+
+Networking.Chat.OnServerEvent:Connect(function(player, message, channel)
+	Networking.Chat:FireAllClients(message, channel)
 end)
 
-Net.GetPrice:SetCallback(function(player, itemId)
+Networking.GetPrice:SetCallback(function(player, itemId)
 	return 100
 end)
 ```
 
 ```lua
 -- Client
-Net.Chat.OnClientEvent:Connect(function(message, channel)
+const Networking = require(ReplicatedStorage.Networking)
+
+Networking.Chat.OnClientEvent:Connect(function(message, channel)
 	print(message)
 end)
 
-Net.Chat:FireServer("hello", 1)
-const price = Net.GetPrice:InvokeServer("sword")
+Networking.Chat:FireServer("hello", 1)
+const price = Networking.GetPrice:InvokeServer("sword")
 ```
 
 ## Types
@@ -137,7 +143,7 @@ Funcs work in both directions and are always reliable. Invoking a client has som
 
 ## Gotchas
 
-- **Register in the same order on both sides.** IDs are assigned in registration order, and a mismatch sends data to the wrong handler without any error. Put every definition in one shared module and create them all before the first fire.
+- **Register in the same order on both sides.** IDs are assigned in registration order, and a mismatch sends data to the wrong handler without any error. Define everything in `Networking` and require it before anything fires.
 - **`enumFromKeys` and `enumFromValues` need the same set on both sides.** Keep the source table in ReplicatedStorage, written out literally.
 - **`array` can't hold nil.** `array(optional(x))` gets cut off at the first nil.
 - **`udim`, `udim2` and `vec*i16` wrap around when out of range.** Only `Typecheck` catches it.

@@ -7,6 +7,6 @@ authors = ["Raph"]
 realm = "shared"
 registry = "https://github.com/UpliftGames/wally-index"
 repository = "https://github.com/minecoiii2/bitnet"
-exclude = ["rokit.toml", "build.project.json", ".github"]
+exclude = ["rokit.toml", "build.project.json", "networking.project.json", "Networking.luau", ".github"]
 
 [dependencies]

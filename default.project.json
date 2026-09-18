@@ -1,6 +1,6 @@
 {
 	"name": "bitnet",
 	"tree": {
-		"$path": "src"
+		"$path": "BitNet"
 	}
 }

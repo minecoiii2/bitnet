@@ -24,10 +24,12 @@ jobs:
 
       - uses: CompeyDev/setup-rokit@v0.2.1
 
-      - name: Build model
-        run: rojo build build.project.json -o BitNet.rbxm
+      - name: Build models
+        run: |
+          rojo build build.project.json -o BitNet.rbxm
+          rojo build networking.project.json -o Networking.rbxm
 
       - name: Create release
-        run: gh release create "$GITHUB_REF_NAME" BitNet.rbxm --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" BitNet.rbxm Networking.rbxm --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
