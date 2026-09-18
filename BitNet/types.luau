@@ -24,7 +24,8 @@ export type BitnetTypes = {
 	nothing: nil,
 	ref: unknown,
 	unknown: unknown,
-	instance: Instance,
+	instance: (...string) -> Instance,
+	player: Player,
 	number: number,
 
 	buffer: buffer,
@@ -39,7 +40,7 @@ export type BitnetTypes = {
 	udim2: UDim2,
 	numbersequence: NumberSequence,
 	colorsequence: ColorSequence,
-	any: any,
+	auto: any,
 
 	struct: <T>(format: T) -> T,
 	array: <T>(value: T) -> { [number]: T },
@@ -92,26 +93,47 @@ export type ServerFunction<A..., R...> = {
 	SetClientCallback: (self: ServerFunction<A..., R...>, callback: (A...) -> R...) -> (),
 }
 
+export type Config = {
+	DEFAULT_FUNC_TIMEOUT: number?,
+	MAX_PENDING_PER_PLAYER: number?,
+
+	VALIDATE_OUTGOING_TYPES: boolean?,
+	VALIDATE_INCOMING_TYPES: boolean?,
+	VALIDATE_DEFAULT_REJECT_NON_FINITE: boolean?,
+	VALIDATE_MAX_DECOMPRESSED_BYTES: number?,
+
+	MAX_UNRELIABLE_BYTES: number?,
+	UNRELIABLE_REF_BYTES: number?,
+	PLAYER_ID_ATTRIBUTE: string?,
+	DEFAULT_BIN_SIZE: number?,
+	BIN_GROWTH_FACTOR: number?,
+}
+
 export type Bitnet = {
 	types: BitnetTypes,
 	
 	event: <A...>(config: {
 		Args: (A...) -> (), 
 		Reliable: boolean?, 
-		Typecheck: boolean?,
+		ValidateOutgoing: boolean?,
 		RateLimit: { calls: number, per: number }?,
+		ValidateAcceptNonFinite: boolean?,
 	}) -> ServerEvent<A...>,
 	
 	func: <A..., R...>(config: {
 		Args: (A...) -> (),
 		Returns: (R...) -> (),
 		Timeout: number?,
-		Typecheck: boolean?,
+		ValidateOutgoing: boolean?,
 		RateLimit: { calls: number, per: number }?,
+		ValidateAcceptNonFinite: boolean?,
 	}) -> ServerFunction<A..., R...>,
 
 	signal: <T...>() -> signal.Signal<T...>,
-	--tuple: <T...>(T...) -> { any },
+	
+	-- signals
+	
+	OnRejected: signal.Signal<Player?, number?, string>,
 }
 
 return nil

@@ -2,6 +2,8 @@
 --!optimize 2
 
 const hash = require(script.Parent.libs.hash)
+const constants = require(script.Parent.constants)
+const playerIds = require(script.Parent.runtime.players)
 
 const buf_writeu8 = buffer.writeu8
 const buf_writeu16 = buffer.writeu16
@@ -48,6 +50,9 @@ const ANGLE_SCALE = 65536 / TAU
 
 const COMPRESS_DEFAULT_LEVEL = -2
 const COMPRESS_MIN_BYTES = 128
+
+const VALIDATE = constants.VALIDATE_INCOMING_TYPES
+const MAX_DECOMPRESSED = constants.VALIDATE_MAX_DECOMPRESSED_BYTES
 
 local EncodingService = nil
 local CompressionAlgorithm = nil
@@ -1008,32 +1013,539 @@ primitives.ref = {
 	end,
 }
 
-primitives.instance = {
-	size = 0,
+const playersById = playerIds.byId
+const playerIdFor = playerIds.idFor
+
+-- one byte: the server gives every player a u8 id and publishes it as an attribute (runtime.players)
+primitives.player = {
+	size = 1,
 	check = function(v)
 		if v == nil then return true end
-		const tof = typeof(v)
-		if tof ~= 'Instance' then
-			return false, "instance expected, got " .. tof
+		if _typeof(v) ~= "Instance" then
+			return false, "expected Player, got " .. _typeof(v)
+		end
+		if not v:IsA("Player") then
+			return false, "expected Player, got " .. v.ClassName
 		end
 		return true
 	end,
-	write = function(b, c, v, context)
-		const count = context.refCount + 1
-		context.refCount = count
-		context.refs[count] = if v == nil then false else v
+	write = function(b, c, v)
+		buf_writeu8(b, c, if v then playerIdFor(v) else 0)
+		return c + 1
+	end,
+	read = function(b, c)
+		return playersById[buf_readu8(b, c)], c + 1
+	end,
+	_writeMany = function(b, c, value, len)
+		for i = 1, len do
+			const v = value[i]
+			buf_writeu8(b, c, if v then playerIdFor(v) else 0)
+			c += 1
+		end
 		return c
 	end,
-	read = function(b, c, context)
-		const count = context.refCount + 1
-		context.refCount = count
-		const v = context.refs[count]
-		return (if v then v else nil), c
+	_readMany = function(b, c, out, len)
+		for i = 1, len do
+			out[i] = playersById[buf_readu8(b, c)]
+			c += 1
+		end
+		return c
 	end,
 }
 
 primitives.number = primitives.f64
 primitives.unknown = primitives.ref
+
+
+const VANISHED_REF_ALLOWANCE = 1024
+const EMPTY_ELEMENT_ALLOWANCE = 1024
+const AUTO_MAX_DEPTH = 128
+const ZSTD_MAGIC = 0xFD2FB528
+
+primitives.bool._minBits = 1
+primitives.ref._minRefs = 1
+
+const function fail(message: string)
+	error(message, 0)
+end
+
+const function cleanError(err): string
+	local message = tostring(err)
+	message = string_gsub(message, "^.-:%d+: ", "")
+	message = string_gsub(message, "^bitnet: ", "")
+	return message
+end
+
+const function minWire(t): (number, number, number)
+	local bytes = t._minBytes
+	if bytes == nil then
+		bytes = if t.size then t.size else 1
+	end
+	return bytes, t._minBits or 0, t._minRefs or 0
+end
+
+const function readCount(b, c: number): (number, number)
+	const count = buf_readu8(b, c)
+	if count < 128 then
+		return count, c + 1
+	end
+	return readLengthSlow(b, c)
+end
+
+const function checkCount(count: number, minBytes: number, minBits: number, minRefs: number, b, c: number, context, what: string)
+	if count == 0 then
+		return
+	end
+	if minBytes > 0 then
+		const left = buf_len(b) - c
+		if count * minBytes > left then
+			fail(`{what} of {count} needs at least {count * minBytes} bytes, {left} left`)
+		end
+	elseif minBits > 0 then
+		const left = (buf_len(context.bools) - context.amount) * 8 + 8
+		if count * minBits > left then
+			fail(`{what} of {count} needs at least {count * minBits} booleans, at most {left} left`)
+		end
+	elseif minRefs > 0 then
+		local room = context.refRoom
+		if room == nil then
+			room = VANISHED_REF_ALLOWANCE
+			for _ in context.refs do
+				room += 1
+			end
+			context.refRoom = room
+		end
+		const left = room - context.refCount
+		if count * minRefs > left then
+			fail(`{what} of {count} needs at least {count * minRefs} refs, at most {left} left`)
+		end
+	else
+		const left = if context.emptyRoom == nil then EMPTY_ELEMENT_ALLOWANCE else context.emptyRoom
+		if count > left then
+			fail(`{what} of {count} empty elements exceeds the {left} left for this batch`)
+		end
+		context.emptyRoom = left - count
+	end
+end
+
+const function checkMapCount(count: number)
+	if count > 16383 then
+		fail(`map of {count} entries exceeds the 16383 limit`)
+	end
+end
+
+const function strictBool(b, c, context)
+	local value = context.value
+	if value == 256 then
+		const amount = context.amount
+		if amount >= buf_len(context.bools) then
+			fail("boolean side channel ran out")
+		end
+		value = buf_readu8(context.bools, amount) * 2 + 1
+		context.amount = amount + 1
+	end
+	context.value = value % 256 * 2
+	return value >= 256, c
+end
+
+const function nonFinite(context, what: string, shown: string)
+	const entries = context.entries
+	const entry = if entries then entries[context.frameId] else nil
+	if entry and entry._acceptNonFinite then
+		return
+	end
+	fail(`{what} is not finite ({shown})`)
+end
+
+const function zstdContentSize(b, c: number, finish: number): number
+	local total = 0
+	while c < finish do
+		if finish - c < 6 or buf_readu32(b, c) ~= ZSTD_MAGIC then
+			fail("compressed payload is not a zstd frame")
+		end
+		const descriptor = buf_readu8(b, c + 4)
+		c += 5
+		if bit_band(descriptor, 3) ~= 0 then
+			fail("zstd dictionaries are not supported")
+		end
+		const singleSegment = bit_band(descriptor, 32) ~= 0
+		if not singleSegment then
+			c += 1
+		end
+		const sizeFlag = bit_rshift(descriptor, 6)
+		if sizeFlag == 0 then
+			if not singleSegment then
+				fail("zstd frame does not declare its content size")
+			end
+			total += buf_readu8(b, c)
+			c += 1
+		elseif sizeFlag == 1 then
+			total += buf_readu16(b, c) + 256
+			c += 2
+		elseif sizeFlag == 2 then
+			total += buf_readu32(b, c)
+			c += 4
+		else
+			total += buf_readu32(b, c) + buf_readu32(b, c + 4) * 4294967296
+			c += 8
+		end
+		local last = false
+		while not last do
+			if finish - c < 3 then
+				fail("zstd frame is truncated")
+			end
+			const header = buf_readu16(b, c) + buf_readu8(b, c + 2) * 65536
+			c += 3
+			last = header % 2 == 1
+			const blockType = bit_band(bit_rshift(header, 1), 3)
+			if blockType == 3 then
+				fail("zstd block type is reserved")
+			end
+			c += if blockType == 1 then 1 else bit_rshift(header, 3)
+		end
+		if bit_band(descriptor, 4) ~= 0 then
+			c += 4
+		end
+	end
+	if c ~= finish then
+		fail("zstd frame overruns its payload")
+	end
+	return total
+end
+
+if VALIDATE then
+	primitives.bool.read = strictBool
+
+	primitives.ref.read = function(b, c, context)
+		const count = context.refCount + 1
+		context.refCount = count
+		const v = context.refs[count]
+		if v == false then
+			return (if strictBool(b, c, context) then false else nil), c
+		end
+		return v, c
+	end
+
+	primitives.string.read = function(b, c)
+		local len = buf_readu8(b, c)
+		if len < 128 then
+			c += 1
+		else
+			len, c = readLengthSlow(b, c)
+		end
+		const left = buf_len(b) - c
+		if len > left then
+			fail(`string of {len} bytes, {left} left`)
+		end
+		return buf_readstring(b, c, len), c + len
+	end
+
+	primitives.buffer.read = function(b, c)
+		local len = buf_readu8(b, c)
+		if len < 128 then
+			c += 1
+		else
+			len, c = readLengthSlow(b, c)
+		end
+		const left = buf_len(b) - c
+		if len > left then
+			fail(`buffer of {len} bytes, {left} left`)
+		end
+		const out = buf_create(len)
+		buf_copy(out, 0, b, c, len)
+		return out, c + len
+	end
+
+	primitives.f24.read = function(b, c, context)
+		buf_writeu32(f24Scratch, 0, (buf_readu16(b, c) + buf_readu8(b, c + 2) * 65536) * 256)
+		const v = buf_readf32(f24Scratch, 0)
+		if v - v ~= 0 then
+			nonFinite(context, "f24", tostring(v))
+		end
+		return v, c + 3
+	end
+	primitives.f24._readMany = function(b, c, out, len, context)
+		for i = 1, len do
+			buf_writeu32(f24Scratch, 0, (buf_readu16(b, c) + buf_readu8(b, c + 2) * 65536) * 256)
+			const v = buf_readf32(f24Scratch, 0)
+			if v - v ~= 0 then
+				nonFinite(context, "f24", tostring(v))
+			end
+			out[i] = v
+			c += 3
+		end
+		return c
+	end
+
+	primitives.f32.read = function(b, c, context)
+		const v = buf_readf32(b, c)
+		if v - v ~= 0 then
+			nonFinite(context, "f32", tostring(v))
+		end
+		return v, c + 4
+	end
+	primitives.f32._readMany = function(b, c, out, len, context)
+		for i = 1, len do
+			const v = buf_readf32(b, c)
+			if v - v ~= 0 then
+				nonFinite(context, "f32", tostring(v))
+			end
+			out[i] = v
+			c += 4
+		end
+		return c
+	end
+
+	primitives.f64.read = function(b, c, context)
+		const v = buf_readf64(b, c)
+		if v - v ~= 0 then
+			nonFinite(context, "f64", tostring(v))
+		end
+		return v, c + 8
+	end
+	primitives.f64._readMany = function(b, c, out, len, context)
+		for i = 1, len do
+			const v = buf_readf64(b, c)
+			if v - v ~= 0 then
+				nonFinite(context, "f64", tostring(v))
+			end
+			out[i] = v
+			c += 8
+		end
+		return c
+	end
+
+	primitives.vec2.read = function(b, c, context)
+		const x = buf_readf32(b, c)
+		const y = buf_readf32(b, c + 4)
+		if (x - x) + (y - y) ~= 0 then
+			nonFinite(context, "Vector2", `{x}, {y}`)
+		end
+		return Vector2.new(x, y), c + 8
+	end
+	primitives.vec2._readMany = function(b, c, out, len, context)
+		for i = 1, len do
+			const x = buf_readf32(b, c)
+			const y = buf_readf32(b, c + 4)
+			if (x - x) + (y - y) ~= 0 then
+				nonFinite(context, "Vector2", `{x}, {y}`)
+			end
+			out[i] = Vector2.new(x, y)
+			c += 8
+		end
+		return c
+	end
+
+	primitives.vec3.read = function(b, c, context)
+		const x = buf_readf32(b, c)
+		const y = buf_readf32(b, c + 4)
+		const z = buf_readf32(b, c + 8)
+		if (x - x) + (y - y) + (z - z) ~= 0 then
+			nonFinite(context, "Vector3", `{x}, {y}, {z}`)
+		end
+		return Vector3.new(x, y, z), c + 12
+	end
+	primitives.vec3._readMany = function(b, c, out, len, context)
+		for i = 1, len do
+			const x = buf_readf32(b, c)
+			const y = buf_readf32(b, c + 4)
+			const z = buf_readf32(b, c + 8)
+			if (x - x) + (y - y) + (z - z) ~= 0 then
+				nonFinite(context, "Vector3", `{x}, {y}, {z}`)
+			end
+			out[i] = Vector3.new(x, y, z)
+			c += 12
+		end
+		return c
+	end
+
+	primitives.cframe.read = function(b, c, context)
+		const x = buf_readf32(b, c)
+		const y = buf_readf32(b, c + 4)
+		const z = buf_readf32(b, c + 8)
+		if (x - x) + (y - y) + (z - z) ~= 0 then
+			nonFinite(context, "CFrame position", `{x}, {y}, {z}`)
+		end
+		return CFrame.fromOrientation(
+			buf_readu16(b, c + 12) / ANGLE_SCALE,
+			buf_readu16(b, c + 14) / ANGLE_SCALE,
+			buf_readu16(b, c + 16) / ANGLE_SCALE
+		) + Vector3.new(x, y, z), c + 18
+	end
+
+	primitives.cframelong.read = function(b, c, context)
+		const x = buf_readf32(b, c)
+		const y = buf_readf32(b, c + 4)
+		const z = buf_readf32(b, c + 8)
+		const rx = buf_readf32(b, c + 12)
+		const ry = buf_readf32(b, c + 16)
+		const rz = buf_readf32(b, c + 20)
+		if (x - x) + (y - y) + (z - z) + (rx - rx) + (ry - ry) + (rz - rz) ~= 0 then
+			nonFinite(context, "CFrame", `{x}, {y}, {z}, {rx}, {ry}, {rz}`)
+		end
+		return CFrame.fromOrientation(rx, ry, rz) + Vector3.new(x, y, z), c + 24
+	end
+
+	primitives.numberrange.read = function(b, c, context)
+		const min = buf_readf32(b, c)
+		const max = buf_readf32(b, c + 4)
+		if (min - min) + (max - max) ~= 0 then
+			nonFinite(context, "NumberRange", `{min}, {max}`)
+		end
+		return NumberRange.new(min, max), c + 8
+	end
+
+	primitives.numbersequence.read = function(b, c, context)
+		const compact = strictBool(b, c, context)
+		const n = buf_readu8(b, c)
+		c += 1
+		const keypoints = table_create(n)
+		if compact then
+			for i = 1, n do
+				keypoints[i] = NumberSequenceKeypoint.new(
+					buf_readu16(b, c) / 65535,
+					buf_readu8(b, c + 2) / 255,
+					buf_readu8(b, c + 3) / 255
+				)
+				c += 4
+			end
+			return NumberSequence.new(keypoints), c
+		end
+		for i = 1, n do
+			const t = buf_readf32(b, c)
+			const v = buf_readf32(b, c + 4)
+			const e = buf_readf32(b, c + 8)
+			if (t - t) + (v - v) + (e - e) ~= 0 then
+				nonFinite(context, `NumberSequence keypoint {i}`, `{t}, {v}, {e}`)
+			end
+			keypoints[i] = NumberSequenceKeypoint.new(t, v, e)
+			c += 12
+		end
+		return NumberSequence.new(keypoints), c
+	end
+
+	primitives.colorsequence.read = function(b, c, context)
+		const n = buf_readu8(b, c)
+		c += 1
+		const keypoints = table_create(n)
+		for i = 1, n do
+			const t = buf_readf32(b, c)
+			if t - t ~= 0 then
+				nonFinite(context, `ColorSequence keypoint {i} time`, tostring(t))
+			end
+			keypoints[i] = ColorSequenceKeypoint.new(
+				t,
+				Color3.fromRGB(buf_readu8(b, c + 4), buf_readu8(b, c + 5), buf_readu8(b, c + 6))
+			)
+			c += 7
+		end
+		return ColorSequence.new(keypoints), c
+	end
+end
+
+const function attempt(t, b, c: number, context)
+	const refCount, amount, value = context.refCount, context.amount, context.value
+	const ok, result, nextCursor = pcall(t.read, b, c, context)
+	if ok then
+		return true, result, nextCursor
+	end
+	context.refCount = refCount
+	context.amount = amount
+	context.value = value
+	return false, cleanError(result), c
+end
+
+const function leafReason(t, b, c: number, context): string?
+	const ok, reason = attempt(t, b, c, context)
+	if ok then
+		return nil
+	end
+	if t.size and t.size > 0 and string_find(reason, "out of bounds", 1, true) then
+		return `needs {t.size} bytes, {buf_len(b) - c} left`
+	end
+	return reason
+end
+
+local locate
+
+function locate(t, b, c: number, context, path: string): (string, string?)
+	const kind = t._kind
+	const start, refCount, amount, value = c, context.refCount, context.amount, context.value
+	if kind == "struct" or kind == "tuple" then
+		const types = t._types
+		const keys = t._keys
+		for i = 1, #types do
+			const child = types[i]
+			const ok, _, nextCursor = attempt(child, b, c, context)
+			if not ok then
+				local label
+				if keys then
+					label = if path == "" then keys[i] else `{path}.{keys[i]}`
+				else
+					label = if path == "" then `arg {i}` else `{path}[{i}]`
+				end
+				return locate(child, b, c, context, label)
+			end
+			c = nextCursor
+		end
+	elseif kind == "optional" then
+		const ok, present = pcall(strictBool, b, c, context)
+		if not ok then
+			return path, cleanError(present)
+		end
+		if present then
+			return locate(t._inner, b, c, context, path)
+		end
+		return path, nil
+	elseif kind == "array" or kind == "map" then
+		const ok, count, first = pcall(readCount, b, c)
+		if not ok then
+			return path, cleanError(count)
+		end
+		if kind == "map" then
+			const underLimit, tooMany = pcall(checkMapCount, count)
+			if not underLimit then
+				return path, cleanError(tooMany)
+			end
+		end
+		local minBytes, minBits, minRefs
+		if kind == "array" then
+			minBytes, minBits, minRefs = minWire(t._elem)
+		else
+			const kb, kbits, krefs = minWire(t._key)
+			const vb, vbits, vrefs = minWire(t._value)
+			minBytes, minBits, minRefs = kb + vb, kbits + vbits, krefs + vrefs
+		end
+		const fits, why = pcall(checkCount, count, minBytes, minBits, minRefs, b, first, context, kind)
+		if not fits then
+			return path, cleanError(why)
+		end
+		c = first
+		for i = 1, count do
+			if kind == "array" then
+				const elemOk, _, nextCursor = attempt(t._elem, b, c, context)
+				if not elemOk then
+					return locate(t._elem, b, c, context, `{path}[{i}]`)
+				end
+				c = nextCursor
+			else
+				const keyOk, key, afterKey = attempt(t._key, b, c, context)
+				if not keyOk then
+					return locate(t._key, b, c, context, if path == "" then `key #{i}` else `{path} key #{i}`)
+				end
+				const valueOk, _, afterValue = attempt(t._value, b, afterKey, context)
+				if not valueOk then
+					return locate(t._value, b, afterKey, context, `{path}[{tostring(key)}]`)
+				end
+				c = afterValue
+			end
+		end
+	end
+	context.refCount = refCount
+	context.amount = amount
+	context.value = value
+	return path, leafReason(t, b, start, context)
+end
 
 -- higher level compilers
 
@@ -1063,6 +1575,7 @@ const function compileStruct(fields: { [string]: any })
 	local totalSize = 0
 	local allFixed = true
 	local costly = false
+	local minBytes, minBits, minRefs = 0, 0, 0
 
 	for i, f in sorted do
 		keys[i] = f.key
@@ -1079,6 +1592,10 @@ const function compileStruct(fields: { [string]: any })
 		else
 			allFixed = false
 		end
+		const fb, fbits, frefs = minWire(f.type)
+		minBytes += fb
+		minBits += fbits
+		minRefs += frefs
 	end
 
 	const function writeFn(b, c, value, context)
@@ -1108,10 +1625,11 @@ const function compileStruct(fields: { [string]: any })
 		return true
 	end
 
+	local compiled
 	if allFixed then
-		return { size = totalSize, check = checkFn, write = writeFn, read = readFn }
+		compiled = { size = totalSize, check = checkFn, write = writeFn, read = readFn }
 	else
-		return {
+		compiled = {
 			_costly = costly,
 			sizeOf = function(value)
 				local s = 0
@@ -1126,6 +1644,13 @@ const function compileStruct(fields: { [string]: any })
 			read = readFn,
 		}
 	end
+	compiled._kind = "struct"
+	compiled._keys = keys
+	compiled._types = fieldTypes
+	compiled._minBytes = minBytes
+	compiled._minBits = minBits
+	compiled._minRefs = minRefs
+	return compiled
 end
 
 const function compileArray(elementType)
@@ -1191,6 +1716,27 @@ const function compileArray(elementType)
 		end
 	end
 
+	if VALIDATE then
+		const minBytes, minBits, minRefs = minWire(elementType)
+		readFn = function(b, c, context)
+			local len = buf_readu8(b, c)
+			if len < 128 then
+				c += 1
+			else
+				len, c = readLengthSlow(b, c)
+			end
+			checkCount(len, minBytes, minBits, minRefs, b, c, context, "array")
+			const out = table.create(len)
+			if elemReadMany then
+				return out, elemReadMany(b, c, out, len, context)
+			end
+			for i = 1, len do
+				out[i], c = elemRead(b, c, context)
+			end
+			return out, c
+		end
+	end
+
 	const function checkFn(value)
 		if type(value) ~= "table" then
 			return false, "expected array, got " .. _typeof(value)
@@ -1205,6 +1751,8 @@ const function compileArray(elementType)
 
 	if elemSize then
 		return {
+			_kind = "array",
+			_elem = elementType,
 			sizeOf = function(value)
 				const len = #value
 				return lengthSize(len) + len * elemSize
@@ -1215,6 +1763,8 @@ const function compileArray(elementType)
 		}
 	else
 		return {
+			_kind = "array",
+			_elem = elementType,
 			_costly = true,
 			sizeOf = function(value)
 				const len = #value
@@ -1255,7 +1805,6 @@ const function compileMap(keyType, valueType)
 		if count > 16383 then
 			error("bitnet: map has more than 16383 entries")
 		end
-		-- two-byte varint, padded so the count can be backfilled after the entries
 		buf_writeu8(b, lenCursor, bit_bor(bit_band(count, 127), 128))
 		buf_writeu8(b, lenCursor + 1, bit_rshift(count, 7))
 		return c
@@ -1276,6 +1825,33 @@ const function compileMap(keyType, valueType)
 			out[k] = v
 		end
 		return out, c
+	end
+
+	local mapRead = readFn
+	if VALIDATE then
+		const kb, kbits, krefs = minWire(keyType)
+		const vb, vbits, vrefs = minWire(valueType)
+		mapRead = function(b, c, context)
+			local count = buf_readu8(b, c)
+			if count < 128 then
+				c += 1
+			else
+				count, c = readLengthSlow(b, c)
+			end
+			checkMapCount(count)
+			checkCount(count, kb + vb, kbits + vbits, krefs + vrefs, b, c, context, "map")
+			const out = {}
+			for i = 1, count do
+				local k, v
+				k, c = kRead(b, c, context)
+				if k == nil or k ~= k then
+					fail(`map key #{i} is {tostring(k)}`)
+				end
+				v, c = vRead(b, c, context)
+				out[k] = v
+			end
+			return out, c
+		end
 	end
 
 	const function checkFn(value)
@@ -1328,11 +1904,14 @@ const function compileMap(keyType, valueType)
 	end
 
 	return {
+		_kind = "map",
+		_key = keyType,
+		_value = valueType,
 		_costly = true,
 		sizeOf = sizeOfFn,
 		check = checkFn,
 		write = writeFn,
-		read = readFn,
+		read = mapRead,
 	}
 end
 
@@ -1343,7 +1922,11 @@ const function compileOptional(innerType)
 	const innerSize = innerType.size
 	const innerSizeOf = innerType.sizeOf
 
-	return {
+	const compiled = {
+		_kind = "optional",
+		_inner = innerType,
+		_minBytes = 0,
+		_minBits = 1,
 		_costly = innerType._costly,
 		sizeOf = function(value)
 			if value == nil then return 0 end
@@ -1383,6 +1966,88 @@ const function compileOptional(innerType)
 			return nil, c
 		end,
 	}
+	if VALIDATE then
+		compiled.read = function(b, c, context)
+			if strictBool(b, c, context) then
+				return innerRead(b, c, context)
+			end
+			return nil, c
+		end
+	end
+	return compiled
+end
+
+const instanceCache: { [string]: any } = {}
+
+const function compileInstance(...: string)
+	const classNames = { ... }
+	const n = #classNames
+	for i = 1, n do
+		if type(classNames[i]) ~= "string" then
+			error(`bitnet: types.instance class name {i} must be a string, got {_typeof(classNames[i])}`, 2)
+		end
+	end
+	const key = table.concat(classNames, "\0")
+	const cached = instanceCache[key]
+	if cached then
+		return cached
+	end
+
+	const expected = if n == 0 then "instance" else table.concat(classNames, " or ")
+	const function allowed(v: Instance): boolean
+		for i = 1, n do
+			if v:IsA(classNames[i]) then
+				return true
+			end
+		end
+		return n == 0
+	end
+
+	const compiled = {
+		size = 0,
+		_minRefs = 1,
+		check = function(v)
+			if v == nil then return true end
+			if _typeof(v) ~= "Instance" then
+				return false, `{expected} expected, got {_typeof(v)}`
+			end
+			if not allowed(v) then
+				return false, `{expected} expected, got {v.ClassName}`
+			end
+			return true
+		end,
+		write = function(b, c, v, context)
+			const count = context.refCount + 1
+			context.refCount = count
+			context.refs[count] = if v == nil then false else v
+			return c
+		end,
+		read = function(b, c, context)
+			const count = context.refCount + 1
+			context.refCount = count
+			const v = context.refs[count]
+			return (if v then v else nil), c
+		end,
+	}
+	if VALIDATE then
+		compiled.read = function(b, c, context)
+			const count = context.refCount + 1
+			context.refCount = count
+			const v = context.refs[count]
+			if not v then
+				return nil, c
+			end
+			if _typeof(v) ~= "Instance" then
+				fail(`{expected} expected, got {_typeof(v)}`)
+			end
+			if n > 0 and not allowed(v) then
+				fail(`{expected} expected, got {v.ClassName}`)
+			end
+			return v, c
+		end
+	end
+	instanceCache[key] = compiled
+	return compiled
 end
 
 const function compileCompress(innerType, level: number?)
@@ -1401,7 +2066,7 @@ const function compileCompress(innerType, level: number?)
 	const innerSize = innerType.size
 	const innerSizeOf = innerType.sizeOf
 
-	return {
+	const compiled = {
 		_costly = true,
 		_isTuple = innerType._isTuple,
 		_arity = innerType._arity,
@@ -1412,9 +2077,6 @@ const function compileCompress(innerType, level: number?)
 		end,
 		write = function(b, c, value, context)
 			const raw = innerSize or innerSizeOf(value)
-			-- one spare byte as a margin, not a requirement: only the first `written` bytes are ever
-			-- emitted, so it cannot reach the wire, and a type that overran its declared size by one
-			-- could not corrupt anything here
 			const scratch = buf_create(raw + 1)
 			const written = innerWrite(scratch, 0, value, context)
 
@@ -1422,7 +2084,6 @@ const function compileCompress(innerType, level: number?)
 			local len = written
 			local compressed = 0
 			if written >= COMPRESS_MIN_BYTES then
-				-- CompressBuffer consumes a whole buffer, so the slack has to be trimmed off first
 				const exact = buf_create(written)
 				buf_copy(exact, 0, scratch, 0, written)
 				const packed = service:CompressBuffer(exact, algorithm, lvl)
@@ -1465,6 +2126,46 @@ const function compileCompress(innerType, level: number?)
 			return value, c + len
 		end,
 	}
+	if VALIDATE then
+		compiled.read = function(b, c, context)
+			local header = buf_readu8(b, c)
+			if header < 128 then
+				c += 1
+			else
+				header, c = readLengthSlow(b, c)
+			end
+			const compressed = header % 2
+			const len = (header - compressed) / 2
+			const left = buf_len(b) - c
+			if len > left then
+				fail(`compress payload of {len} bytes, {left} left`)
+			end
+
+			if compressed == 0 then
+				const value, innerEnd = innerRead(b, c, context)
+				if innerEnd ~= c + len then
+					fail(`compress payload declared {len} bytes but its value took {innerEnd - c}`)
+				end
+				return value, c + len
+			end
+
+			const size = zstdContentSize(b, c, c + len)
+			const spent = context.inflated or 0
+			if spent + size > MAX_DECOMPRESSED then
+				fail(`compress payload would inflate to {size} bytes, {MAX_DECOMPRESSED - spent} left for this batch`)
+			end
+			context.inflated = spent + size
+			const packed = buf_create(len)
+			buf_copy(packed, 0, b, c, len)
+			const raw = service:DecompressBuffer(packed, algorithm)
+			const value, innerEnd = innerRead(raw, 0, context)
+			if innerEnd ~= buf_len(raw) then
+				fail(`compress payload inflated to {buf_len(raw)} bytes but its value took {innerEnd}`)
+			end
+			return value, c + len
+		end
+	end
+	return compiled
 end
 
 const enumTypes: { [Enum]: any } = {}
@@ -1692,6 +2393,7 @@ const function compileTuple(...)
 	local totalSize = 0
 	local allFixed = true
 	local costly = false
+	local minBytes, minBits, minRefs = 0, 0, 0
 
 	for i = 1, n do
 		const t = elements[i]
@@ -1707,6 +2409,10 @@ const function compileTuple(...)
 		else
 			allFixed = false
 		end
+		const tb, tbits, trefs = minWire(t)
+		minBytes += tb
+		minBits += tbits
+		minRefs += trefs
 	end
 
 	const function writeFn(b, c, value, context)
@@ -1804,8 +2510,9 @@ const function compileTuple(...)
 		end
 	end
 
+	local compiled
 	if allFixed then
-		return {
+		compiled = {
 			_isTuple = true,
 			_arity = n,
 			_writeArgs = writeArgs,
@@ -1816,7 +2523,7 @@ const function compileTuple(...)
 			read = readFn,
 		}
 	else
-		return {
+		compiled = {
 			_isTuple = true,
 			_arity = n,
 			_costly = costly,
@@ -1836,6 +2543,12 @@ const function compileTuple(...)
 			read = readFn,
 		}
 	end
+	compiled._kind = "tuple"
+	compiled._types = fieldTypes
+	compiled._minBytes = minBytes
+	compiled._minBits = minBits
+	compiled._minRefs = minRefs
+	return compiled
 end
 
 const fixedVec3Cache: { [number]: any } = {}
@@ -1962,6 +2675,7 @@ types.struct = compileStruct
 types.array = compileArray
 types.map = compileMap
 types.optional = compileOptional
+types.instance = compileInstance
 types.enum = compileEnum
 types.enumFromKeys = compileEnumFromKeys
 types.enumFromValues = compileEnumFromValues
@@ -1970,7 +2684,7 @@ types.vec3i16 = compileVec3i16
 types.vec2i16 = compileVec2i16
 types.compress = compileCompress
 
--- .any support
+-- .auto support
 
 const TAG_NIL = 0
 const TAG_BOOL = 1
@@ -2011,24 +2725,32 @@ const TAG_TO_TYPE = {
 	[TAG_COLORSEQUENCE] = primitives.colorsequence,
 }
 
--- classify a table as array tuple or map
 const function classifyTable(t): number
+	const packed = rawget(t, "n")
+	if packed ~= nil then
+		if type(packed) ~= "number" or packed < 0 or packed % 1 ~= 0 then
+			return TAG_MAP
+		end
+		local count = 0
+		for k in t do
+			if k ~= "n" then
+				if type(k) ~= "number" or k < 1 or k > packed or k % 1 ~= 0 then
+					return TAG_MAP
+				end
+				count += 1
+			end
+		end
+		return if packed - count <= count + 8 then TAG_TUPLE else TAG_MAP
+	end
 	const n = #t
 	if n == 0 then
-		if next(t) == nil then return TAG_ARRAY end  -- empty
-		return TAG_MAP
+		return if next(t) == nil then TAG_ARRAY else TAG_MAP
 	end
 	local count = 0
-	local hasN = false
-	for k in t do
+	for _ in t do
 		count += 1
-		if k == "n" then hasN = true end
 	end
-	if count == n then return TAG_ARRAY end
-	if hasN and count == n + 1 and type(t.n) == "number" and t.n == n then
-		return TAG_TUPLE
-	end
-	return TAG_MAP
+	return if count == n then TAG_ARRAY else TAG_MAP
 end
 
 const function tagFor(v)
@@ -2052,21 +2774,21 @@ const function tagFor(v)
 	return TAG_REF
 end
 
-local sizeOfAny
-local writeAny
-local readAny
+local sizeOfAuto
+local writeAuto
+local readAuto
 
-function sizeOfAny(v)
+function sizeOfAuto(v)
 	const tag = tagFor(v)
 	if tag == TAG_ARRAY or tag == TAG_TUPLE then
-		const n = #v
+		const n = if tag == TAG_TUPLE then rawget(v, "n") else #v
 		local s = 1 + lengthSize(n)
-		for i = 1, n do s += sizeOfAny(v[i]) end
+		for i = 1, n do s += sizeOfAuto(v[i]) end
 		return s
 	elseif tag == TAG_MAP then
 		local s = 3
 		for k, val in v do
-			s += sizeOfAny(k) + sizeOfAny(val)
+			s += sizeOfAuto(k) + sizeOfAuto(val)
 		end
 		return s
 	end
@@ -2074,31 +2796,31 @@ function sizeOfAny(v)
 	return 1 + (t.size or t.sizeOf(v))
 end
 
-function writeAny(b, c, v, context)
+function writeAuto(b, c, v, context)
 	const tag = tagFor(v)
 	buf_writeu8(b, c, tag)
 	c += 1
 	if tag == TAG_ARRAY or tag == TAG_TUPLE then
-		const n = #v
+		const n = if tag == TAG_TUPLE then rawget(v, "n") else #v
 		if n < 128 then
 			buf_writeu8(b, c, n)
 			c += 1
 		else
 			c = writeLength(b, c, n)
 		end
-		for i = 1, n do c = writeAny(b, c, v[i], context) end
+		for i = 1, n do c = writeAuto(b, c, v[i], context) end
 		return c
 	elseif tag == TAG_MAP then
 		const countCursor = c
 		c += 2
 		local count = 0
 		for k, val in v do
-			c = writeAny(b, c, k, context)
-			c = writeAny(b, c, val, context)
+			c = writeAuto(b, c, k, context)
+			c = writeAuto(b, c, val, context)
 			count += 1
 		end
 		if count > 16383 then
-			error("bitnet: types.any map has more than 16383 entries")
+			error("bitnet: types.auto map has more than 16383 entries")
 		end
 		buf_writeu8(b, countCursor, bit_bor(bit_band(count, 127), 128))
 		buf_writeu8(b, countCursor + 1, bit_rshift(count, 7))
@@ -2107,7 +2829,7 @@ function writeAny(b, c, v, context)
 	return TAG_TO_TYPE[tag].write(b, c, v, context)
 end
 
-function readAny(b, c, context)
+function readAuto(b, c, context)
 	const tag = buf_readu8(b, c)
 	c += 1
 	if tag == TAG_ARRAY then
@@ -2118,7 +2840,7 @@ function readAny(b, c, context)
 			n, c = readLengthSlow(b, c)
 		end
 		const out = table.create(n)
-		for i = 1, n do out[i], c = readAny(b, c, context) end
+		for i = 1, n do out[i], c = readAuto(b, c, context) end
 		return out, c
 	elseif tag == TAG_TUPLE then
 		local n = buf_readu8(b, c)
@@ -2128,7 +2850,7 @@ function readAny(b, c, context)
 			n, c = readLengthSlow(b, c)
 		end
 		const out = table.create(n)
-		for i = 1, n do out[i], c = readAny(b, c, context) end
+		for i = 1, n do out[i], c = readAuto(b, c, context) end
 		out.n = n
 		return out, c
 	elseif tag == TAG_MAP then
@@ -2141,35 +2863,83 @@ function readAny(b, c, context)
 		const out = {}
 		for _ = 1, count do
 			local k
-			k, c = readAny(b, c, context)
+			k, c = readAuto(b, c, context)
 			local val
-			val, c = readAny(b, c, context)
+			val, c = readAuto(b, c, context)
 			out[k] = val
 		end
 		return out, c
 	end
 	const t = TAG_TO_TYPE[tag]
-	if not t then error("bitnet: types.any unknown tag " .. tag) end
+	if not t then error("bitnet: types.auto unknown tag " .. tag) end
 	return t.read(b, c, context)
 end
 
-const function checkAny(v)
+local readAutoStrict
+
+function readAutoStrict(b, c, context, depth)
+	const tag = buf_readu8(b, c)
+	c += 1
+	if tag == TAG_ARRAY or tag == TAG_TUPLE or tag == TAG_MAP then
+		const level = (depth or 0) + 1
+		if level > AUTO_MAX_DEPTH then
+			fail(`auto nests deeper than {AUTO_MAX_DEPTH} levels`)
+		end
+		local n = buf_readu8(b, c)
+		if n < 128 then
+			c += 1
+		else
+			n, c = readLengthSlow(b, c)
+		end
+		if tag == TAG_MAP then
+			checkCount(n, 2, 0, 0, b, c, context, "auto map")
+			const out = {}
+			for i = 1, n do
+				local k, val
+				k, c = readAutoStrict(b, c, context, level)
+				if k == nil or k ~= k then
+					fail(`auto map key #{i} is {tostring(k)}`)
+				end
+				val, c = readAutoStrict(b, c, context, level)
+				out[k] = val
+			end
+			return out, c
+		end
+		checkCount(n, 1, 0, 0, b, c, context, "auto array")
+		const out = table.create(n)
+		for i = 1, n do
+			out[i], c = readAutoStrict(b, c, context, level)
+		end
+		if tag == TAG_TUPLE then
+			out.n = n
+		end
+		return out, c
+	end
+	const t = TAG_TO_TYPE[tag]
+	if not t then
+		fail(`auto has unknown tag {tag}`)
+	end
+	return t.read(b, c, context)
+end
+
+const function checkAuto(v)
 	const lt = type(v)
 	if lt == "function" or lt == "thread" then
-		return false, "types.any cannot encode " .. lt
+		return false, "types.auto cannot encode " .. lt
 	end
 	if lt == "table" then
 		const tag = classifyTable(v)
 		if tag == TAG_ARRAY or tag == TAG_TUPLE then
-			for i = 1, #v do
-				const ok, err = checkAny(v[i])
+			const n = if tag == TAG_TUPLE then rawget(v, "n") else #v
+			for i = 1, n do
+				const ok, err = checkAuto(v[i])
 				if not ok then return false, "[" .. i .. "]: " .. err end
 			end
 		else
 			for k, val in v do
-				local ok, err = checkAny(k)
+				local ok, err = checkAuto(k)
 				if not ok then return false, "key: " .. err end
-				ok, err = checkAny(val)
+				ok, err = checkAuto(val)
 				if not ok then return false, "value at " .. tostring(k) .. ": " .. err end
 			end
 		end
@@ -2177,15 +2947,17 @@ const function checkAny(v)
 	return true
 end
 
-types.any = {
+types.auto = {
 	_costly = true,
-	sizeOf = sizeOfAny,
-	check = checkAny,
-	write = writeAny,
-	read = readAny,
+	sizeOf = sizeOfAuto,
+	check = checkAuto,
+	write = writeAuto,
+	read = if VALIDATE then readAutoStrict else readAuto,
 }
 
 return {
 	types = types,
 	primitives = primitives,
+	locate = locate,
+	cleanError = cleanError,
 }

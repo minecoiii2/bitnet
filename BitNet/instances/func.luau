@@ -14,6 +14,7 @@ const Bin = require(script.Parent.Parent.bin)
 const binaries = require(script.Parent.Parent.binaries)
 const registry = require(script.Parent.Parent.runtime.registry)
 const constants = require(script.Parent.Parent.constants)
+const codec = require(script.Parent.Parent.codec)
 const assertAt = require(script.Parent.Parent.libs.assertAt)
 
 const Bin_reserve = Bin.reserve
@@ -27,14 +28,13 @@ const buf_readu16 = buffer.readu16
 const table_unpack = table.unpack
 const table_pack = table.pack
 const table_create = table.create
+const locate = codec.locate
 
-const DEFAULT_TIMEOUT = constants.DEFAULT_FUNC_TIMEOUT
 const MAX_PENDING = constants.MAX_PENDING_PER_PLAYER
 
 const REQUEST_FLAG = 32768
 const REQID_SPACE = 32768
 
--- one connection for the whole module rather than one per func
 const playerCleanups: { (player: Player) -> () } = {}
 if IS_SERVER then
 	Players.PlayerRemoving:Connect(function(player)
@@ -50,18 +50,19 @@ const module = {}
 --   options.Args      -- request payload
 --   options.Returns   -- response payload
 --   options.Timeout   -- seconds to wait for response (default: constants.DEFAULT_FUNC_TIMEOUT)
---   options.Typecheck -- rruntime structural validation before send (default: constants.DEFAULT_TYPECHECK)
+--   options.ValidateOutgoing -- check values against the schema before send (default: constants.VALIDATE_OUTGOING_TYPES)
 --   options.RateLimit -- server-side gate
 function module.new(options: {
 	Args: any,
 	Returns: any,
 	Timeout: number?,
-	Typecheck: boolean?,
+	ValidateOutgoing: boolean?,
 	RateLimit: { calls: number, per: number }?,
+	ValidateAcceptNonFinite: boolean?,
 })
 	const args = options.Args
 	const returns = options.Returns
-	const typecheck = if options.Typecheck == nil then constants.DEFAULT_TYPECHECK else options.Typecheck
+	const typecheck = if options.ValidateOutgoing == nil then constants.VALIDATE_OUTGOING_TYPES else options.ValidateOutgoing
 
 	assertAt(args, "bitnet.func: options.Args is required", 2)
 	assertAt(args.write and args.read,
@@ -72,8 +73,9 @@ function module.new(options: {
 
 	assertAt(options.Direction == nil,
 		"bitnet.func: options.Direction no longer exists, every func works in both directions", 2)
+	assertAt(options.Typecheck == nil, "bitnet.func: options.Typecheck is now ValidateOutgoing", 2)
 
-	const timeoutSeconds = options.Timeout or DEFAULT_TIMEOUT
+	const timeoutSeconds = options.Timeout or constants.DEFAULT_FUNC_TIMEOUT
 
 	const isTuple = args._isTuple == true
 	
@@ -93,12 +95,29 @@ function module.new(options: {
 		returnsIsTuple = returns._isTuple == true,
 		returnsArity = returns._arity,
 		_pending = {},
+		_acceptNonFinite = if options.ValidateAcceptNonFinite == nil
+			then not constants.VALIDATE_DEFAULT_REJECT_NON_FINITE
+			else options.ValidateAcceptNonFinite,
 
 		callback = nil,
 	}
 
 	registry.register(self)
 	const id = self.id
+
+	self._diagnose = function(buf, cursor, context)
+		const request = buf_readu16(buf, cursor) >= REQUEST_FLAG
+		const path, reason = locate(if request then args else returns, buf, cursor + 2, context, "")
+		const side = if request then "request" else "response"
+		return (if path == "" then side else `{side} {path}`), reason
+	end
+
+	self._skip = function(buf, cursor, context)
+		const schema = if buf_readu16(buf, cursor) >= REQUEST_FLAG then args else returns
+		const _, nextCursor = schema.read(buf, cursor + 2, context)
+		return nextCursor
+	end
+
 	local hdrSize = 0
 	local hdrLow = 0
 	local hdrHigh = 0
@@ -159,11 +178,11 @@ function module.new(options: {
 
 		if typecheck then
 			if not isTuple and select('#', ...) > 1 then
-				error(`bitnet.func #{id} tuple typecheck failed: too many values`)
+				error(`bitnet.func #{id} outgoing validation failed: too many values`, 2)
 			end
 			const ok, err = args.check(value)
 			if not ok then
-				error(`bitnet.func #{id} typecheck failed: {err}`, 2)
+				error(`bitnet.func #{id} outgoing validation failed: {err}`, 2)
 			end
 		end
 
@@ -212,11 +231,11 @@ function module.new(options: {
 
 		if typecheck then
 			if not isTuple and select('#', ...) > 1 then
-				error(`bitnet.func #{id} tuple typecheck failed: too many values`)
+				error(`bitnet.func #{id} outgoing validation failed: too many values`, 2)
 			end
 			const ok, err = args.check(value)
 			if not ok then
-				error(`bitnet.func #{id} typecheck failed: {err}`, 2)
+				error(`bitnet.func #{id} outgoing validation failed: {err}`, 2)
 			end
 		end
 
@@ -342,7 +361,7 @@ function module.new(options: {
 		if typecheck then
 			const vok, verr = returns.check(response)
 			if not vok then
-				warn(`bitnet: func #{id} returns typecheck failed: {verr}`)
+				warn(`bitnet.func #{id} returns outgoing validation failed: {verr}`)
 				return nextCursor
 			end
 		end

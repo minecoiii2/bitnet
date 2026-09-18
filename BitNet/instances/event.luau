@@ -11,6 +11,7 @@ const binaries = require(script.Parent.Parent.binaries)
 const registry = require(script.Parent.Parent.runtime.registry)
 const Signal = require(script.Parent.signal)
 const constants = require(script.Parent.Parent.constants)
+const codec = require(script.Parent.Parent.codec)
 const assertAt = require(script.Parent.Parent.libs.assertAt)
 const getNearbyPlayers = require(script.Parent.Parent.libs.getNearbyPlayers)
 
@@ -26,6 +27,7 @@ const buf_copy = buffer.copy
 const bit_lshift = bit32.lshift
 const bit_countlz = bit32.countlz
 const table_unpack = table.unpack
+const locate = codec.locate
 
 const MAX_UNRELIABLE_BYTES = constants.MAX_UNRELIABLE_BYTES
 const REF_BYTES = constants.UNRELIABLE_REF_BYTES
@@ -104,12 +106,13 @@ end
 --   options.Args      -- payload
 --   options.Reliable  -- defaults to true
 --   options.RateLimit -- server-side gate
---   options.Typecheck -- runtime structural validation before send (default: constants.DEFAULT_TYPECHECK)
+--   options.ValidateOutgoing -- check values against the schema before send (default: constants.VALIDATE_OUTGOING_TYPES)
 function module.new(options: {
 	Args: any,
 	Reliable: boolean?,
-	Typecheck: boolean?,
+	ValidateOutgoing: boolean?,
 	RateLimit: { calls: number, per: number }?,
+	ValidateAcceptNonFinite: boolean?,
 	Debug: boolean?,
 })
 	assertAt(type(options) == 'table', "bitnet.event: options expected a table")
@@ -117,7 +120,8 @@ function module.new(options: {
 	const debugEnabled = options.Debug == true
 	const schema = options.Args
 	const reliable = options.Reliable ~= false
-	const typecheck = if options.Typecheck == nil then constants.DEFAULT_TYPECHECK else options.Typecheck
+	assertAt(options.Typecheck == nil, "bitnet.event: options.Typecheck is now ValidateOutgoing", 2)
+	const typecheck = if options.ValidateOutgoing == nil then constants.VALIDATE_OUTGOING_TYPES else options.ValidateOutgoing
 
 	assertAt(schema, "bitnet.event: options.Args is required", 2)
 	assertAt(schema.write and schema.read,
@@ -140,6 +144,9 @@ function module.new(options: {
 		rateState = if options.RateLimit
 			then setmetatable({}, { __mode = "k" })
 			else nil,
+		_acceptNonFinite = if options.ValidateAcceptNonFinite == nil
+			then not constants.VALIDATE_DEFAULT_REJECT_NON_FINITE
+			else options.ValidateAcceptNonFinite,
 		OnServerEvent = sig,
 		OnClientEvent = sig,
 		OnReceived = sig,
@@ -148,12 +155,26 @@ function module.new(options: {
 	registry.register(self)
 	const id = self.id
 
+	self._diagnose = function(buf, cursor, context)
+		return locate(schema, buf, cursor, context, "")
+	end
+
 	const spread = isTuple and schema._writeArgs ~= nil
 	const packed = isTuple and not spread
 	const payloadSize = schema.size
 	const payloadSizeOf = if spread then schema._sizeArgs else schema.sizeOf
 	const payloadWrite = if spread then schema._writeArgs else schema.write
 	const payloadRead = if spread then schema._readArgs else schema.read
+
+	self._skip = if spread
+		then function(buf, cursor, context)
+			payloadRead(buf, cursor, context)
+			return context.readCursor
+		end
+		else function(buf, cursor, context)
+			const _, nextCursor = payloadRead(buf, cursor, context)
+			return nextCursor
+		end
 	const rateLimited = self.rateLimit ~= nil
 	const costly = schema._costly == true
 
@@ -330,12 +351,12 @@ function module.new(options: {
 
 	const function validate(...)
 		if not isTuple and select('#', ...) > 1 then
-			error(`bitnet.event #{id} tuple typecheck failed: too many values`)
+			error(`bitnet.event #{id} outgoing validation failed: too many values`, 3)
 		end
 		const value = if isTuple then {...} else (...)
 		const ok, err = schema.check(value)
 		if not ok then
-			error(`bitnet.event #{id} typecheck failed: {err}`, 3)
+			error(`bitnet.event #{id} outgoing validation failed: {err}`, 3)
 		end
 	end
 

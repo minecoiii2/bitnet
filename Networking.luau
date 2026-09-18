@@ -1,6 +1,8 @@
 const ReplicatedStorage = game:GetService("ReplicatedStorage")
 const RunService = game:GetService("RunService")
-const BitNet = require(ReplicatedStorage.BitNet)
+
+const BitNet = require(ReplicatedStorage.BitNet)({})
+
 const BitNetTypes = BitNet.types
 
 const optional = BitNetTypes.optional
@@ -22,8 +24,7 @@ const f24 = BitNetTypes.f24
 const f32 = BitNetTypes.f32
 const f64 = BitNetTypes.f64
 
-const any = BitNetTypes.ref
-const auto = BitNetTypes.any
+const auto = BitNetTypes.auto
 const string = BitNetTypes.string
 const uuid = BitNetTypes.uuid
 const bool = BitNetTypes.bool
@@ -32,9 +33,11 @@ const CFrame = BitNetTypes.cframe
 const CFrameLong = BitNetTypes.cframelong
 const buffer = BitNetTypes.buffer
 const Instance = BitNetTypes.instance
+const player = BitNetTypes.player
 const nothing = BitNetTypes.nothing
 const unknown = BitNetTypes.unknown
 const ref = BitNetTypes.ref
+const any = BitNetTypes.ref
 const Vector2 = BitNetTypes.vec2
 const Vector3 = BitNetTypes.vec3
 const Color3 = BitNetTypes.color3
