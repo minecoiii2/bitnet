@@ -1,0 +1,11 @@
+Packages/
+ServerPackages/
+DevPackages/
+wally.lock
+sourcemap.json
+
+*.rbxm
+*.rbxmx
+*.rbxl
+*.rbxlx
+*.zip
