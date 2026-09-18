@@ -12,7 +12,7 @@ Buffer-based networking library for Roblox. Replaces RemoteEvents and RemoteFunc
 **Wally**
 ```toml
 [dependencies]
-BitNet = "raph/bitnet@3.0.0"
+BitNet = "minecoiii2/bitnet@3.0.0"
 ```
 
 **Manual:** download `BitNet.rbxm` from [Releases](https://github.com/minecoiii2/bitnet/releases) and insert it into `ReplicatedStorage`.

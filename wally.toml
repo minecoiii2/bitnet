@@ -1,5 +1,5 @@
 [package]
-name = "raph/bitnet"
+name = "minecoiii2/bitnet"
 description = "Super-fast buffer-based networking library for Roblox"
 version = "3.0.0"
 license = "MIT"
