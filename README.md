@@ -60,7 +60,7 @@ Every event and function goes in the table that `Networking` returns. The server
 const BitNet = require(ReplicatedStorage.BitNet)({})
 ...
 
-local Islands = enumFromKeys(ReplicatedStorage.IslandDictionary)
+local Islands = enumFromKeys(IslandDictionary)
 
 return {
 	Chat = {
@@ -159,8 +159,8 @@ The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) save bytes but cost 
 | `Args` | required | Payload schema |
 | `Reliable` | `true` | Use the reliable or unreliable channel |
 | `RateLimit` | `nil` | `{ calls, per }` limit on fires per client |
-| `ValidateOutgoing` | Studio only | Check values against the schema before sending |
-| `ValidateAcceptNonFinite` | `false` | Let NaN and inf through incoming validation |
+| `ValidateOutgoing` | `Constants.VALIDATE_OUTGOING_TYPES` | Check values against the schema before sending |
+| `ValidateAcceptNonFinite` | `Constants.VALIDATE_DEFAULT_REJECT_NON_FINITE` | Let NaN and inf through incoming validation |
 
 **Methods:**
 - `:FireServer(...)`
@@ -183,10 +183,10 @@ On the client, fires that arrive before anything is connected are queued (up to 
 | ------ | ------- | ----------- |
 | `Args` | required | Request schema |
 | `Returns` | required | Response schema |
-| `Timeout` | `7` | Yield timeout. `0` or `math.huge` waits forever |
+| `Timeout` | `Constants.DEFAULT_FUNC_TIMEOUT` | Yield timeout. `0` or `math.huge` waits forever |
 | `RateLimit` | `nil` | `{ calls, per }` limit on invokes per client |
-| `ValidateOutgoing` | Studio only | Check values against the schema before sending |
-| `ValidateAcceptNonFinite` | `false` | Let NaN and inf through incoming validation |
+| `ValidateOutgoing` | `Constants.VALIDATE_OUTGOING_TYPES` | Check values against the schema before sending |
+| `ValidateAcceptNonFinite` | `Constants.VALIDATE_DEFAULT_REJECT_NON_FINITE` | Let NaN and inf through incoming validation |
 
 **Methods:**
 - `:InvokeServer(...)`
