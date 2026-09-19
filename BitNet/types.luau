@@ -96,6 +96,7 @@ export type ServerFunction<A..., R...> = {
 export type Config = {
 	DEFAULT_FUNC_TIMEOUT: number?,
 	MAX_PENDING_PER_PLAYER: number?,
+	MAX_CALLBACKS_PER_PLAYER: number?,
 
 	VALIDATE_OUTGOING_TYPES: boolean?,
 	VALIDATE_INCOMING_TYPES: boolean?,

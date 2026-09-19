@@ -17,8 +17,10 @@ const getNearbyPlayers = require(script.Parent.Parent.libs.getNearbyPlayers)
 
 const Bin_reserve = Bin.reserve
 const Bin_tryWrite = Bin.tryWrite
-const Bin_flushBools = Bin.flushBools
+const Bin_pushBits = Bin.pushBits
+const Bin_recover = Bin.recover
 const markDirty = binaries.markDirty
+const binFor = binaries.binFor
 const getHeader = registry.getHeader
 const rateLimitAllowed = registry.rateLimitAllowed
 const buf_writeu8 = buffer.writeu8
@@ -50,11 +52,15 @@ const function resetScratch()
 	scratch.splitCount = 0
 	scratch.chunkCursor = 0
 	scratch.chunkAmount = 0
+	scratch.safeCursor = -1
 end
 
 const function appendScratch(bin, unreliable: boolean)
 	const frameBytes = scratch.cursor
 	const c0 = bin.cursor
+	if c0 == bin.safeCursor then
+		Bin_recover(bin)
+	end
 	if c0 == 0 then
 		markDirty(bin)
 	end
@@ -65,16 +71,24 @@ const function appendScratch(bin, unreliable: boolean)
 	const c1 = c0 + frameBytes
 	bin.cursor = c1
 
-	Bin_flushBools(bin)
 	const a0 = bin.amount
 	const boolBytes = scratch.amount
-	if boolBytes > 0 then
-		const src = scratch.bools
+	const src = scratch.bools
+	if bin.value == 1 then
 		const dst = bin.bools
 		for index = 1, boolBytes do
 			dst[a0 + index] = src[index]
 		end
 		bin.amount = a0 + boolBytes
+	else
+		for index = 1, boolBytes do
+			Bin_pushBits(bin, src[index], 8)
+		end
+	end
+	const tail = scratch.value
+	if tail ~= 1 then
+		const count = 31 - bit_countlz(tail)
+		Bin_pushBits(bin, tail - bit_lshift(1, count), count)
 	end
 
 	const r0 = bin.refCount
@@ -129,8 +143,6 @@ function module.new(options: {
 
 	const isTuple = schema._isTuple == true
 	const arity = schema._arity
-	
-	const sig = Signal.new(not IS_SERVER)
 
 	const self = {
 		kind = "event",
@@ -147,13 +159,15 @@ function module.new(options: {
 		_acceptNonFinite = if options.ValidateAcceptNonFinite == nil
 			then not constants.VALIDATE_DEFAULT_REJECT_NON_FINITE
 			else options.ValidateAcceptNonFinite,
-		OnServerEvent = sig,
-		OnClientEvent = sig,
-		OnReceived = sig,
 	}
 
 	registry.register(self)
 	const id = self.id
+
+	const sig = Signal.new(not IS_SERVER, `bitnet.event #{id}`)
+	self.OnServerEvent = sig
+	self.OnClientEvent = sig
+	self.OnReceived = sig
 
 	self._diagnose = function(buf, cursor, context)
 		return locate(schema, buf, cursor, context, "")
@@ -177,6 +191,9 @@ function module.new(options: {
 		end
 	const rateLimited = self.rateLimit ~= nil
 	const costly = schema._costly == true
+	-- a schema that never touches the bool or ref channels leaves nothing behind when it fails, so
+	-- only the others pay for the rollback marker
+	const marked = schema._sideChannel ~= false
 
 	local hdrSize = 0
 	local hdrLow = 0
@@ -190,6 +207,9 @@ function module.new(options: {
 				hdrSize, hdrLow, hdrHigh = getHeader(self)
 			end
 			const c0 = bin.cursor
+			if c0 == bin.safeCursor then
+				Bin_recover(bin)
+			end
 			const a0 = bin.amount
 			const r0 = bin.refCount
 			const need = hdrSize + sizeHint
@@ -216,6 +236,9 @@ function module.new(options: {
 				hdrSize, hdrLow, hdrHigh = getHeader(self)
 			end
 			const c = bin.cursor
+			if c == bin.safeCursor then
+				Bin_recover(bin)
+			end
 			const need = hdrSize + (payloadSize or payloadSizeOf(v1, v2, v3, v4, v5, v6))
 			if c + need > bin.size then
 				Bin_reserve(bin, need)
@@ -229,6 +252,12 @@ function module.new(options: {
 					buf_writeu8(b, c + 2, hdrHigh)
 				end
 			end
+			if marked then
+				bin.safeCursor = c
+				bin.safeAmount = bin.amount
+				bin.safeValue = bin.value
+				bin.safeRefs = bin.refCount
+			end
 			bin.cursor = payloadWrite(b, c + hdrSize, v1, bin, v2, v3, v4, v5, v6)
 		end
 	elseif costly then
@@ -237,6 +266,9 @@ function module.new(options: {
 				hdrSize, hdrLow, hdrHigh = getHeader(self)
 			end
 			const c0 = bin.cursor
+			if c0 == bin.safeCursor then
+				Bin_recover(bin)
+			end
 			const a0 = bin.amount
 			const r0 = bin.refCount
 			const need = hdrSize + sizeHint
@@ -296,6 +328,9 @@ function module.new(options: {
 				hdrSize, hdrLow, hdrHigh = getHeader(self)
 			end
 			const c0 = bin.cursor
+			if c0 == bin.safeCursor then
+				Bin_recover(bin)
+			end
 			const a0 = bin.amount
 			const r0 = bin.refCount
 			const need = hdrSize + (payloadSize or payloadSizeOf(v1, v2, v3, v4, v5, v6))
@@ -310,6 +345,12 @@ function module.new(options: {
 				if hdrSize == 3 then
 					buf_writeu8(b, c0 + 2, hdrHigh)
 				end
+			end
+			if marked then
+				bin.safeCursor = c0
+				bin.safeAmount = a0
+				bin.safeValue = bin.value
+				bin.safeRefs = r0
 			end
 			const c1 = payloadWrite(b, c0 + hdrSize, v1, bin, v2, v3, v4, v5, v6)
 			bin.cursor = c1
@@ -374,7 +415,7 @@ function module.new(options: {
 				if typecheck then
 					validate(...)
 				end
-				const bin = playerBins[player]
+				const bin = playerBins[player] or binFor(player, reliable)
 				if not bin then return end
 				if bin.cursor == 0 then
 					markDirty(bin)
@@ -401,7 +442,7 @@ function module.new(options: {
 			end
 		else
 			function self:FireClient(player: Player, v1, v2, v3, v4, v5, v6)
-				const bin = playerBins[player]
+				const bin = playerBins[player] or binFor(player, reliable)
 				if not bin then return end
 				if bin.cursor == 0 then
 					markDirty(bin)
@@ -424,11 +465,10 @@ function module.new(options: {
 			else
 				writeFrame(scratch, ...)
 			end
-			Bin_flushBools(scratch)
 			if scratch.cursor > 0 then
 				for _, player in players do
 					if player == exclude then continue end
-					const bin = playerBins[player]
+					const bin = playerBins[player] or binFor(player, reliable)
 					if bin then
 						appendScratch(bin, unreliable)
 					end

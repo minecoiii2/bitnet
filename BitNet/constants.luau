@@ -4,7 +4,8 @@ const IS_SERVER = RunService:IsServer()
 
 return {
 	DEFAULT_FUNC_TIMEOUT = 7, -- client remote function timeout
-	MAX_PENDING_PER_PLAYER = 32, -- outstanding InvokeClient calls allowed per player
+	MAX_PENDING_PER_PLAYER = 32, -- max invokes the server sent a player that await an answer
+	MAX_CALLBACKS_PER_PLAYER = 32, -- max invokes a player sent the server that are still running
 
 	VALIDATE_OUTGOING_TYPES = true and IS_STUDIO, -- check values against their schema before sending
 	VALIDATE_INCOMING_TYPES = IS_SERVER, -- decode incoming frames strictly and reject malformed ones

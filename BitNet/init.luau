@@ -1,7 +1,7 @@
 --!native
 --!optimize 2
 
--- VERSION 3.1.0
+-- VERSION 3.2.0
 
 const IS_STUDIO = game:GetService("RunService"):IsStudio()
 
@@ -11,9 +11,16 @@ end
 
 const types = require(script.types)
 local init = false
+local cache
 
 return function(config: {[string]: any}): types.Bitnet
-	if init then error("Bitnet already initialized", 2) end
+	if init then
+		if config then
+			error("Bitnet already initialized", 2)
+		else
+			return cache
+		end
+	end
 	init = true
 	
 	const constants = require(script.constants)
@@ -37,6 +44,7 @@ return function(config: {[string]: any}): types.Bitnet
 
 		OnRejected = dispatch.OnRejected,
 	}
+	cache = bitnet
 	
 	print('Bitnet: initialized')
 	

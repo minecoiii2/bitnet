@@ -18,6 +18,8 @@ const Bin_snapshot = Bin.snapshot
 const Bin_snapshotBools = Bin.snapshotBools
 const Bin_flushBools = Bin.flushBools
 const Bin_flush = Bin.flush
+const Bin_recover = Bin.recover
+const Bin_settle = Bin.settle
 const getDirty = binaries.getDirty
 const clearDirty = binaries.clearDirty
 const getByteMode = registry.getByteMode
@@ -54,12 +56,11 @@ const function malformed(player: Player?, id: number?, reason: string)
 	end
 end
 
-const function processBatch(player: Player?, buf: buffer, context, resetBools: boolean, dry: boolean?)
-	local cursor = 0
+const function processBatch(player: Player?, buf: buffer, context, resetBools: boolean, dry: boolean?, start: number?)
+	local cursor = if start then start else 0
 	const len = buf_len(buf)
 	const byteMode = getByteMode()
 	while cursor < len do
-		-- `cursor < len` already guarantees at least one byte, so there is no length check here
 		const first = buf_readu8(buf, cursor)
 		local id
 		if byteMode or first < 128 then
@@ -119,37 +120,82 @@ const function processBatch(player: Player?, buf: buffer, context, resetBools: b
 	end
 end
 
--- Slow path: replays the batch without firing anything. Frames that decoded before decode again, so
--- the first failure is the same frame, reached with the same side channel state, and can be walked
--- field by field.
-const function diagnose(player: Player?, buf: buffer, context, resetBools: boolean, err)
-	const id = context.frameId
-	const entry = registry_ALL[id]
-	local reason = cleanError(err)
-	if entry then
-		const replay = {
-			refs = context.refs,
-			refCount = 0,
-			bools = context.bools,
-			amount = 0,
-			value = 256,
-			readCursor = 0,
-			frameId = 0,
-			entries = registry_ALL,
-		}
-		if not pcall(processBatch, player, buf, replay, resetBools, true) and replay.frameId == id then
-			replay.refCount = replay.frameRefs
-			replay.amount = replay.frameAmount
-			replay.value = replay.frameValue
-			replay.inflated = replay.frameInflated
-			replay.emptyRoom = replay.frameEmpty
-			const ok, path, detail = pcall(entry._diagnose, buf, replay.frameStart, replay)
-			if ok and detail then
-				reason = if path == "" then detail else `{path}: {detail}`
+const MAX_SKIPPED_FRAMES = 16
+
+const function rewindFrame(replay)
+	replay.refCount = replay.frameRefs
+	replay.amount = replay.frameAmount
+	replay.value = replay.frameValue
+	replay.inflated = replay.frameInflated
+	replay.emptyRoom = replay.frameEmpty
+end
+
+const function dispatchValidated(player: Player?, buf: buffer, refs, bools: buffer, resetBools: boolean)
+	local context = {
+		refs = refs,
+		refCount = 0,
+		bools = bools,
+		amount = 0,
+		value = 256,
+		readCursor = 0,
+		frameId = 0,
+		entries = registry_ALL,
+	}
+	local start, startRefs, startAmount, startValue, startInflated, startEmpty = 0, 0, 0, 256, nil, nil
+	local skipped = 0
+	while true do
+		const ok, err = pcall(processBatch, player, buf, context, resetBools, false, start)
+		if ok then
+			return
+		end
+
+		const id = context.frameId
+		const entry = registry_ALL[id]
+		const valueFault = context.valueFault == true
+		local reason = cleanError(err)
+		local replay = nil
+		if entry then
+			replay = {
+				refs = refs,
+				refCount = startRefs,
+				bools = bools,
+				amount = startAmount,
+				value = startValue,
+				inflated = startInflated,
+				emptyRoom = startEmpty,
+				readCursor = 0,
+				frameId = 0,
+				entries = registry_ALL,
+			}
+			if not pcall(processBatch, player, buf, replay, resetBools, true, start) and replay.frameId == id then
+				rewindFrame(replay)
+				const found, path, detail = pcall(entry._diagnose, buf, replay.frameStart, replay)
+				if found and detail then
+					reason = if path == "" then detail else `{path}: {detail}`
+				end
+			else
+				replay = nil
 			end
 		end
+		reject(player, entry, if entry then id else nil, reason)
+
+		if replay == nil or not valueFault or skipped >= MAX_SKIPPED_FRAMES then
+			return
+		end
+		rewindFrame(replay)
+		replay.valueFault = nil
+		replay.skipNonFinite = true
+		const decoded, nextCursor = pcall(entry._skip, buf, replay.frameStart, replay)
+		replay.skipNonFinite = nil
+		if not decoded then
+			return
+		end
+		skipped += 1
+		start = nextCursor
+		startRefs, startAmount, startValue = replay.refCount, replay.amount, replay.value
+		startInflated, startEmpty = replay.inflated, replay.emptyRoom
+		context = replay
 	end
-	reject(player, entry, if entry then id else nil, reason)
 end
 
 const function dispatchIncoming(player: Player?, buf: buffer, recvRefs, recvBools, resetBools: boolean)
@@ -161,20 +207,10 @@ const function dispatchIncoming(player: Player?, buf: buffer, recvRefs, recvBool
 			reject(player, nil, nil, `malformed batch of ({_typeof(buf)}, {_typeof(recvRefs)}, {_typeof(recvBools)})`)
 			return
 		end
-		const context = {
-			refs = if recvRefs then recvRefs else EMPTY_REFS,
-			refCount = 0,
-			bools = if recvBools then recvBools else EMPTY_BUFFER,
-			amount = 0,
-			value = 256,
-			readCursor = 0,
-			frameId = 0,
-			entries = registry_ALL,
-		}
-		const ok, err = pcall(processBatch, player, buf, context, resetBools)
-		if not ok then
-			diagnose(player, buf, context, resetBools, err)
-		end
+		dispatchValidated(player, buf,
+			if recvRefs then recvRefs else EMPTY_REFS,
+			if recvBools then recvBools else EMPTY_BUFFER,
+			resetBools)
 		return
 	end
 	const context = {
@@ -230,9 +266,13 @@ const reUnreliable = remotes.unreliable
 binaries.setRemotes(reReliable, reUnreliable)
 
 const function sendBin(bin)
+	if bin.cursor == bin.safeCursor then
+		Bin_recover(bin)
+	end
 	Bin_flushBools(bin)
 	const target = bin._target
 	const re = bin._remote
+	const used = bin.cursor
 	const splitCount = bin.splitCount
 	const refCount = bin.refCount
 	local refs = nil
@@ -246,12 +286,12 @@ const function sendBin(bin)
 		const snapBools = Bin_snapshotBools(bin)
 		Bin_flush(bin)
 		fire(re, target, snap, refs, snapBools)
+		Bin_settle(bin, used)
 		return
 	end
 
 	const buf = bin.buffer
 	const splits = bin.splits
-	const endCursor = bin.cursor
 	const endAmount = bin.amount
 	Bin_flush(bin)
 
@@ -264,7 +304,7 @@ const function sendBin(bin)
 			toAmount = splits[splitIndex + 1]
 			toRefs = splits[splitIndex + 2]
 		else
-			toCursor = endCursor
+			toCursor = used
 			toAmount = endAmount
 			toRefs = refCount
 		end
@@ -292,6 +332,7 @@ const function sendBin(bin)
 		fromRefs = toRefs
 		splitIndex += 3
 	end
+	Bin_settle(bin, used)
 end
 
 if IS_SERVER then

@@ -1,8 +1,6 @@
 --!native
 --!optimize 2
 
--- u8 ids for types.player. The server hands each player one and publishes it as an attribute, which
--- replicates, so both sides map Player <-> id without the Instance ever riding the refs channel.
 
 const Players = game:GetService("Players")
 const RunService = game:GetService("RunService")
@@ -12,9 +10,11 @@ const constants = require(script.Parent.Parent.constants)
 
 const ATTRIBUTE = constants.PLAYER_ID_ATTRIBUTE
 const MAX_ID = 255
+const RELEASE_DELAY = 5
 
 const byId: { [number]: Player } = {}
 const idOf: { [Player]: number } = {}
+const leaving = setmetatable({} :: { [Player]: boolean }, { __mode = "k" })
 
 const function release(player: Player)
 	const id = idOf[player]
@@ -31,8 +31,6 @@ local idFor: (player: Player) -> number
 if IS_SERVER then
 	local lastId = 0
 
-	-- round robin rather than lowest free, so a leaver's id is the last to be reused and a frame still
-	-- in flight about them is least likely to resolve to whoever replaced them
 	const function assign(player: Player): number
 		for _ = 1, MAX_ID do
 			lastId = lastId % MAX_ID + 1
@@ -51,8 +49,7 @@ if IS_SERVER then
 		if id then
 			return id
 		end
-		-- someone who already left gets no id; a receiver could only resolve it to nil anyway
-		if player.Parent ~= Players then
+		if player.Parent ~= Players or leaving[player] then
 			return 0
 		end
 		return assign(player)
@@ -90,7 +87,10 @@ else
 	end
 end
 
-Players.PlayerRemoving:Connect(release)
+Players.PlayerRemoving:Connect(function(player: Player)
+	leaving[player] = true
+	task.delay(RELEASE_DELAY, release, player)
+end)
 
 return {
 	byId = byId,

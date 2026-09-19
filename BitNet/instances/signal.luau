@@ -102,21 +102,50 @@ local Signal = {}
 Signal.__index = Signal
 Signal.__type = "Signal"
 
-function Signal.new<T...>(queue: boolean?): Signal<T...>
+local MAX_QUEUED = 256
+
+function Signal.new<T...>(queue: boolean?, label: string?): Signal<T...>
 	return setmetatable({
 		_handlerListHead = false,
 		_queued = if queue then {} else nil,
+		_label = label,
 	}, Signal)
 end
 
+local function fireHandlers(signal, ...)
+	local item = signal._handlerListHead
+	while item do
+		if item.Connected then
+			if not freeRunnerThread then
+				freeRunnerThread = coroutine.create(runEventHandlerInFreeThread)
+				coroutine.resume(freeRunnerThread)
+			end
+			local bound = item._boundArgs
+			if bound then
+				task.spawn(freeRunnerThread, item._fn, mergeArgs(bound, ...))
+			else
+				task.spawn(freeRunnerThread, item._fn, ...)
+			end
+		end
+		item = item._next
+	end
+end
+
 local function drainQueue(signal)
-	local pending = signal._queued
-	if not pending or not signal._handlerListHead then
+	local queued = signal._queued
+	if not queued then
 		return
 	end
-	signal._queued = nil
-	for _, args in pending do
-		signal:Fire(table.unpack(args, 1, args.n))
+	local index = 0
+	while signal._handlerListHead and index < #queued do
+		index += 1
+		local args = queued[index]
+		fireHandlers(signal, table.unpack(args, 1, args.n))
+	end
+	if index >= #queued then
+		signal._queued = nil
+	elseif index > 0 then
+		signal._queued = table.move(queued, index + 1, #queued, 1, {})
 	end
 end
 
@@ -150,7 +179,12 @@ end
 function Signal:Fire(...)
 	local queued = self._queued
 	if queued then
-		table.insert(queued, table.pack(...))
+		if #queued < MAX_QUEUED then
+			table.insert(queued, table.pack(...))
+		elseif not self._queueFull then
+			self._queueFull = true
+			warn(`{self._label or "signal"}: {MAX_QUEUED} fires are waiting for a handler, dropping new ones until one connects`)
+		end
 		return
 	end
 

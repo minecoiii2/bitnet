@@ -1,11 +1,6 @@
 --!native
 --!optimize 2
 
--- Functions: request/response, client -> server only.
--- Shape: [u8 or varint id][u16 reqid][payload]
---   args (client -> server, the invoke)
---   returns (server -> client, the response)
-
 const Players = game:GetService("Players")
 const RunService = game:GetService("RunService")
 const IS_SERVER = RunService:IsServer()
@@ -19,11 +14,14 @@ const assertAt = require(script.Parent.Parent.libs.assertAt)
 
 const Bin_reserve = Bin.reserve
 const Bin_tryWrite = Bin.tryWrite
+const Bin_recover = Bin.recover
 const markDirty = binaries.markDirty
+const binFor = binaries.binFor
 const getHeader = registry.getHeader
 const rateLimitAllowed = registry.rateLimitAllowed
 const buf_writeu8 = buffer.writeu8
 const buf_writeu16 = buffer.writeu16
+const buf_readu8 = buffer.readu8
 const buf_readu16 = buffer.readu16
 const table_unpack = table.unpack
 const table_pack = table.pack
@@ -31,17 +29,52 @@ const table_create = table.create
 const locate = codec.locate
 
 const MAX_PENDING = constants.MAX_PENDING_PER_PLAYER
+const MAX_CALLBACKS = constants.MAX_CALLBACKS_PER_PLAYER
 
 const REQUEST_FLAG = 32768
-const REQID_SPACE = 32768
+const ERROR_FLAG = 16384
+const REQID_SPACE = 16384
+
+const CALLBACK_ERRORED = 1
+const NO_CALLBACK = 2
+const REFUSED = 3
+const BAD_RESPONSE = 4
+const ERROR_REASONS = {
+	[CALLBACK_ERRORED] = "the callback errored",
+	[NO_CALLBACK] = "no callback is set on the other side",
+	[REFUSED] = "the request was refused by a rate limit or the callback cap",
+	[BAD_RESPONSE] = "the callback returned something that could not be sent",
+}
 
 const playerCleanups: { (player: Player) -> () } = {}
+const running: { [Player]: number } = {}
 if IS_SERVER then
 	Players.PlayerRemoving:Connect(function(player)
+		running[player] = nil
 		for _, clear in playerCleanups do
 			clear(player)
 		end
 	end)
+end
+
+local freeRunner: thread? = nil
+const function runAndRelease(fn, ...)
+	const runner = freeRunner
+	freeRunner = nil
+	fn(...)
+	freeRunner = runner
+end
+const function runnerLoop()
+	while true do
+		runAndRelease(coroutine.yield())
+	end
+end
+const function spawnCallback(fn, ...)
+	if not freeRunner then
+		freeRunner = coroutine.create(runnerLoop)
+		coroutine.resume(freeRunner)
+	end
+	task.spawn(freeRunner :: thread, fn, ...)
 end
 
 const module = {}
@@ -106,15 +139,31 @@ function module.new(options: {
 	const id = self.id
 
 	self._diagnose = function(buf, cursor, context)
-		const request = buf_readu16(buf, cursor) >= REQUEST_FLAG
+		const word = buf_readu16(buf, cursor)
+		if word >= REQUEST_FLAG + ERROR_FLAG then
+			return "request", "request id has the error bit set"
+		elseif word >= ERROR_FLAG and word < REQUEST_FLAG then
+			return "error response", if pcall(buf_readu8, buf, cursor + 2) then nil else "missing its reason code"
+		end
+		const request = word >= REQUEST_FLAG
 		const path, reason = locate(if request then args else returns, buf, cursor + 2, context, "")
 		const side = if request then "request" else "response"
 		return (if path == "" then side else `{side} {path}`), reason
 	end
 
 	self._skip = function(buf, cursor, context)
-		const schema = if buf_readu16(buf, cursor) >= REQUEST_FLAG then args else returns
-		const _, nextCursor = schema.read(buf, cursor + 2, context)
+		const word = buf_readu16(buf, cursor)
+		if word >= REQUEST_FLAG then
+			if word >= REQUEST_FLAG + ERROR_FLAG then
+				error("bitnet: request id has the error bit set", 0)
+			end
+			const _, nextCursor = args.read(buf, cursor + 2, context)
+			return nextCursor
+		elseif word >= ERROR_FLAG then
+			buf_readu8(buf, cursor + 2)
+			return cursor + 3
+		end
+		const _, nextCursor = returns.read(buf, cursor + 2, context)
 		return nextCursor
 	end
 
@@ -124,6 +173,8 @@ function module.new(options: {
 
 	const argsCostly = args._costly == true
 	const returnsCostly = returns._costly == true
+	const argsMarked = args._sideChannel ~= false
+	const returnsMarked = returns._sideChannel ~= false
 	const argsArity = args._arity
 	const returnsIsTuple = returns._isTuple == true
 	const returnsArity = returns._arity
@@ -135,17 +186,18 @@ function module.new(options: {
 	local nextReqId = 0
 	local argsHint = 64
 	local returnsHint = 64
+	local warnedNoCallback = false
 
-	const function writeFrame(bin, reqid: number, schema, costly: boolean, value, hint: number): number
+	-- writes the frame id and the u16 word, returning where the payload goes
+	const function beginFrame(bin, word: number, payload: number): number
 		if hdrSize == 0 then
 			hdrSize, hdrLow, hdrHigh = getHeader(self)
 		end
 		const c0 = bin.cursor
-		const a0 = bin.amount
-		const r0 = bin.refCount
-		const need = if costly
-			then hdrSize + 2 + hint
-			else hdrSize + 2 + (schema.size or schema.sizeOf(value))
+		if c0 == bin.safeCursor then
+			Bin_recover(bin)
+		end
+		const need = hdrSize + 2 + payload
 		if c0 + need > bin.size then
 			Bin_reserve(bin, need)
 		end
@@ -158,16 +210,60 @@ function module.new(options: {
 				buf_writeu8(b, c0 + 2, hdrHigh)
 			end
 		end
+		buf_writeu16(b, c0 + hdrSize, word)
+		return c0 + hdrSize + 2
+	end
 
-		buf_writeu16(b, c0 + hdrSize, reqid)
-		const payloadAt = c0 + hdrSize + 2
+	const function writeFrame(bin, word: number, schema, costly: boolean, marked: boolean, value, hint: number): number
+		const payloadAt = beginFrame(bin, word, if costly then hint else (schema.size or schema.sizeOf(value)))
+		const a0 = bin.amount
+		const r0 = bin.refCount
 		if costly then
 			const c1 = Bin_tryWrite(bin, payloadAt, a0, r0, schema.write, value)
 			bin.cursor = c1
 			return c1 - payloadAt
 		end
-		bin.cursor = schema.write(b, payloadAt, value, bin)
+		if marked then
+			bin.safeCursor = bin.cursor
+			bin.safeAmount = a0
+			bin.safeValue = bin.value
+			bin.safeRefs = r0
+		end
+		bin.cursor = schema.write(bin.buffer, payloadAt, value, bin)
 		return hint
+	end
+
+	const function writeError(bin, reqid: number, code: number)
+		const at = beginFrame(bin, reqid + ERROR_FLAG, 1)
+		buf_writeu8(bin.buffer, at, code)
+		bin.cursor = at + 1
+	end
+
+	const function takeReqId(): number
+		for _ = 1, REQID_SPACE do
+			const reqid = nextReqId
+			nextReqId = (reqid + 1) % REQID_SPACE
+			if pending[reqid] == nil then
+				return reqid
+			end
+		end
+		error(`bitnet.func #{id}: all {REQID_SPACE} request ids are waiting on a response`, 3)
+	end
+
+	const function expireServerInvoke(reqid: number, thread: thread)
+		if pending[reqid] == thread then
+			pending[reqid] = nil
+			task.spawn(thread, false, "timeout")
+		end
+	end
+
+	const function expireClientInvoke(reqid: number, thread: thread)
+		const entry = pending[reqid]
+		if entry and entry.thread == thread then
+			pending[reqid] = nil
+			outstanding[entry.player] = (outstanding[entry.player] or 1) - 1
+			task.spawn(thread, false, "timeout")
+		end
 	end
 
 	function self:InvokeServer(...)
@@ -186,21 +282,14 @@ function module.new(options: {
 			end
 		end
 
-		const reqid = nextReqId
-		nextReqId = (nextReqId + 1) % REQID_SPACE
+		const reqid = takeReqId()
+		argsHint = writeFrame(binaries.globalReliable, reqid + REQUEST_FLAG, args, argsCostly, argsMarked, value, argsHint)
 
 		const thread = coroutine.running()
 		pending[reqid] = thread
 
-		argsHint = writeFrame(binaries.globalReliable, reqid + REQUEST_FLAG, args, argsCostly, value, argsHint)
-
 		if hasTimeout then
-			task.delay(timeout, function()
-				if pending[reqid] then
-					pending[reqid] = nil
-					task.spawn(thread, false, "timeout")
-				end
-			end)
+			task.delay(timeout, expireServerInvoke, reqid, thread)
 		end
 
 		const ok, resultOrErr = coroutine.yield()
@@ -222,7 +311,7 @@ function module.new(options: {
 		if not hasTimeout then
 			error(`bitnet.func #{id}:InvokeClient needs a finite positive Timeout; a client that never answers would park this thread forever`, 2)
 		end
-		const bin = binaries.playersReliable[player]
+		const bin = binaries.playersReliable[player] or binFor(player, true)
 		if not bin then
 			error(`bitnet.func #{id}:InvokeClient has no bin for {tostring(player)}`, 2)
 		end
@@ -244,26 +333,17 @@ function module.new(options: {
 			error(`bitnet.func #{id}: {tostring(player)} already has {used} outstanding invokes`, 2)
 		end
 
-		const reqid = nextReqId
-		nextReqId = (nextReqId + 1) % REQID_SPACE
+		const reqid = takeReqId()
+		if bin.cursor == 0 then
+			markDirty(bin)
+		end
+		argsHint = writeFrame(bin, reqid + REQUEST_FLAG, args, argsCostly, argsMarked, value, argsHint)
 
 		const thread = coroutine.running()
 		pending[reqid] = { thread = thread, player = player }
 		outstanding[player] = used + 1
 
-		if bin.cursor == 0 then
-			markDirty(bin)
-		end
-		argsHint = writeFrame(bin, reqid + REQUEST_FLAG, args, argsCostly, value, argsHint)
-
-		task.delay(timeout, function()
-			const entry = pending[reqid]
-			if entry then
-				pending[reqid] = nil
-				outstanding[entry.player] = (outstanding[entry.player] or 1) - 1
-				task.spawn(entry.thread, false, "timeout")
-			end
-		end)
+		task.delay(timeout, expireClientInvoke, reqid, thread)
 
 		const ok, resultOrErr = coroutine.yield()
 		if not ok then
@@ -293,17 +373,29 @@ function module.new(options: {
 		self.callback = cb
 	end
 
-	const function respond(player: Player, reqid: number, response)
-		const respBin = binaries.playersReliable[player]
-		if not respBin then return end
-		if respBin.cursor == 0 then
-			markDirty(respBin)
+	const function replyBin(player: Player?)
+		if not player then
+			return binaries.globalReliable
 		end
-		returnsHint = writeFrame(respBin, reqid, returns, returnsCostly, response, returnsHint)
+		const bin = binaries.playersReliable[player] or binFor(player, true)
+		if bin and bin.cursor == 0 then
+			markDirty(bin)
+		end
+		return bin
 	end
 
-	const function respondToServer(reqid: number, response)
-		returnsHint = writeFrame(binaries.globalReliable, reqid, returns, returnsCostly, response, returnsHint)
+	const function sendResponse(reqid: number, response, player: Player?)
+		const bin = replyBin(player)
+		if bin then
+			returnsHint = writeFrame(bin, reqid, returns, returnsCostly, returnsMarked, response, returnsHint)
+		end
+	end
+
+	const function sendError(reqid: number, code: number, player: Player?)
+		const bin = replyBin(player)
+		if bin then
+			writeError(bin, reqid, code)
+		end
 	end
 
 	const function runCallback(callback, value, player: Player?)
@@ -348,48 +440,81 @@ function module.new(options: {
 		return true, result
 	end
 
-	const function answer(value, reqid: number, nextCursor: number, player: Player?): number
+	const function answer(value, reqid: number, player: Player?)
 		const callback = self.callback
 		if callback == nil then
-			warn(`bitnet: func {id} has no SetCallback handler`)
-			return nextCursor
+			if not warnedNoCallback then
+				warnedNoCallback = true
+				warn(`bitnet.func #{id} has no callback on this side, so every invoke of it here fails`)
+			end
+			sendError(reqid, NO_CALLBACK, player)
+			return
 		end
 		const ok, response = runCallback(callback, value, player)
 		if not ok then
-			return nextCursor
+			sendError(reqid, CALLBACK_ERRORED, player)
+			return
 		end
 		if typecheck then
 			const vok, verr = returns.check(response)
 			if not vok then
 				warn(`bitnet.func #{id} returns outgoing validation failed: {verr}`)
-				return nextCursor
+				sendError(reqid, BAD_RESPONSE, player)
+				return
 			end
 		end
-		if player then
-			respond(player, reqid, response)
-		else
-			respondToServer(reqid, response)
+		const sent, err = pcall(sendResponse, reqid, response, player)
+		if not sent then
+			warn(`bitnet.func #{id} could not send its response: {tostring(err)}`)
+			sendError(reqid, BAD_RESPONSE, player)
 		end
-		return nextCursor
 	end
 
 	if IS_SERVER then
+		const function answerPlayer(value, reqid: number, player: Player)
+			const ok, err = pcall(answer, value, reqid, player)
+			const inFlight = running[player]
+			if inFlight then
+				running[player] = if inFlight > 1 then inFlight - 1 else nil
+			end
+			if not ok then
+				warn(`bitnet.func #{id} failed to answer {player.Name}: {tostring(err)}`)
+			end
+		end
+
+		const function settle(reqid: number, player: Player, ok: boolean, result)
+			const entry = pending[reqid]
+			if entry and entry.player == player then
+				pending[reqid] = nil
+				outstanding[player] = (outstanding[player] or 1) - 1
+				task.spawn(entry.thread, ok, result)
+			end
+		end
+
 		self._handle = function(buf, cursor, context, player)
 			const word = buf_readu16(buf, cursor)
 			if word >= REQUEST_FLAG then
+				const reqid = word - REQUEST_FLAG
+				if reqid >= REQID_SPACE then
+					error("bitnet: request id has the error bit set", 0)
+				end
 				const value, nextCursor = args.read(buf, cursor + 2, context)
-				if rateLimited and not rateLimitAllowed(self, player) then
+				const inFlight = running[player] or 0
+				if (rateLimited and not rateLimitAllowed(self, player)) or inFlight >= MAX_CALLBACKS then
+					sendError(reqid, REFUSED, player)
 					return nextCursor
 				end
-				return answer(value, word - REQUEST_FLAG, nextCursor, player)
+				running[player] = inFlight + 1
+				spawnCallback(answerPlayer, value, reqid, player)
+				return nextCursor
+			end
+			if word >= ERROR_FLAG then
+				const code = buf_readu8(buf, cursor + 2)
+				settle(word - ERROR_FLAG, player, false, ERROR_REASONS[code] or `error {code}`)
+				return cursor + 3
 			end
 			const value, nextCursor = returns.read(buf, cursor + 2, context)
-			const entry = pending[word]
-			if entry and entry.player == player then
-				pending[word] = nil
-				outstanding[player] = (outstanding[player] or 1) - 1
-				task.spawn(entry.thread, true, value)
-			end
+			settle(word, player, true, value)
 			return nextCursor
 		end
 
@@ -403,18 +528,28 @@ function module.new(options: {
 			outstanding[player] = nil
 		end)
 	else
+		const function settle(reqid: number, ok: boolean, result)
+			const thread = pending[reqid]
+			if thread then
+				pending[reqid] = nil
+				task.spawn(thread, ok, result)
+			end
+		end
+
 		self._handle = function(buf, cursor, context)
 			const word = buf_readu16(buf, cursor)
 			if word >= REQUEST_FLAG then
 				const value, nextCursor = args.read(buf, cursor + 2, context)
-				return answer(value, word - REQUEST_FLAG, nextCursor, nil)
+				spawnCallback(answer, value, word - REQUEST_FLAG, nil)
+				return nextCursor
+			end
+			if word >= ERROR_FLAG then
+				const code = buf_readu8(buf, cursor + 2)
+				settle(word - ERROR_FLAG, false, ERROR_REASONS[code] or `error {code}`)
+				return cursor + 3
 			end
 			const value, nextCursor = returns.read(buf, cursor + 2, context)
-			const thread = pending[word]
-			if thread then
-				pending[word] = nil
-				task.spawn(thread, true, value)
-			end
+			settle(word, true, value)
 			return nextCursor
 		end
 	end

@@ -368,9 +368,6 @@ primitives.i24 = {
 primitives.f24 = {
 	size = 3,
 	check = checkNumber,
-	-- the f32 goes to the scratch buffer rather than straight to b, so the write touches only its
-	-- own 3 bytes. Writing in place and sliding the top 3 bytes down measures the same but runs
-	-- one byte past the field, which every buffer sized from `size` then has to know about.
 	write = function(b, c, v)
 		buf_writef32(f24Scratch, 0, v)
 		buf_copy(b, c, f24Scratch, 1, 3)
@@ -1016,7 +1013,6 @@ primitives.ref = {
 const playersById = playerIds.byId
 const playerIdFor = playerIds.idFor
 
--- one byte: the server gives every player a u8 id and publishes it as an attribute (runtime.players)
 primitives.player = {
 	size = 1,
 	check = function(v)
@@ -1055,6 +1051,15 @@ primitives.player = {
 
 primitives.number = primitives.f64
 primitives.unknown = primitives.ref
+
+primitives.bool._sideChannel = true
+primitives.ref._sideChannel = true
+primitives.numbersequence._sideChannel = true
+for _, t in primitives do
+	if t._sideChannel == nil then
+		t._sideChannel = false
+	end
+end
 
 
 const VANISHED_REF_ALLOWANCE = 1024
@@ -1151,9 +1156,10 @@ end
 const function nonFinite(context, what: string, shown: string)
 	const entries = context.entries
 	const entry = if entries then entries[context.frameId] else nil
-	if entry and entry._acceptNonFinite then
+	if (entry and entry._acceptNonFinite) or context.skipNonFinite then
 		return
 	end
+	context.valueFault = true
 	fail(`{what} is not finite ({shown})`)
 end
 
@@ -1575,6 +1581,7 @@ const function compileStruct(fields: { [string]: any })
 	local totalSize = 0
 	local allFixed = true
 	local costly = false
+	local sideChannel = false
 	local minBytes, minBits, minRefs = 0, 0, 0
 
 	for i, f in sorted do
@@ -1591,6 +1598,9 @@ const function compileStruct(fields: { [string]: any })
 			totalSize += f.type.size
 		else
 			allFixed = false
+		end
+		if f.type._sideChannel ~= false then
+			sideChannel = true
 		end
 		const fb, fbits, frefs = minWire(f.type)
 		minBytes += fb
@@ -1645,6 +1655,7 @@ const function compileStruct(fields: { [string]: any })
 		}
 	end
 	compiled._kind = "struct"
+	compiled._sideChannel = sideChannel
 	compiled._keys = keys
 	compiled._types = fieldTypes
 	compiled._minBytes = minBytes
@@ -1661,6 +1672,7 @@ const function compileArray(elementType)
 	const elemSizeOf = elementType.sizeOf
 	const elemWriteMany = elementType._writeMany
 	const elemReadMany = elementType._readMany
+	const sideChannel = elementType._sideChannel ~= false
 
 	local writeFn
 	local readFn
@@ -1753,6 +1765,7 @@ const function compileArray(elementType)
 		return {
 			_kind = "array",
 			_elem = elementType,
+			_sideChannel = sideChannel,
 			sizeOf = function(value)
 				const len = #value
 				return lengthSize(len) + len * elemSize
@@ -1765,6 +1778,7 @@ const function compileArray(elementType)
 		return {
 			_kind = "array",
 			_elem = elementType,
+			_sideChannel = sideChannel,
 			_costly = true,
 			sizeOf = function(value)
 				const len = #value
@@ -1907,6 +1921,7 @@ const function compileMap(keyType, valueType)
 		_kind = "map",
 		_key = keyType,
 		_value = valueType,
+		_sideChannel = keyType._sideChannel ~= false or valueType._sideChannel ~= false,
 		_costly = true,
 		sizeOf = sizeOfFn,
 		check = checkFn,
@@ -1925,6 +1940,7 @@ const function compileOptional(innerType)
 	const compiled = {
 		_kind = "optional",
 		_inner = innerType,
+		_sideChannel = true,
 		_minBytes = 0,
 		_minBits = 1,
 		_costly = innerType._costly,
@@ -2006,6 +2022,7 @@ const function compileInstance(...: string)
 	const compiled = {
 		size = 0,
 		_minRefs = 1,
+		_sideChannel = true,
 		check = function(v)
 			if v == nil then return true end
 			if _typeof(v) ~= "Instance" then
@@ -2068,6 +2085,7 @@ const function compileCompress(innerType, level: number?)
 
 	const compiled = {
 		_costly = true,
+		_sideChannel = innerType._sideChannel ~= false,
 		_isTuple = innerType._isTuple,
 		_arity = innerType._arity,
 		check = innerType.check,
@@ -2208,6 +2226,7 @@ const function compileEnum(enumType: Enum)
 
 	const compiled = {
 		size = width,
+		_sideChannel = false,
 		check = function(v)
 			if enumItemOwner[v] == enumType then
 				return true
@@ -2275,6 +2294,7 @@ const function compileSymbols(symbols: { string }, origin: string)
 
 	return {
 		size = width,
+		_sideChannel = false,
 		_fingerprint = hash(table.concat(symbols, "\0")),
 		check = function(v)
 			if indexOf[v] ~= nil then
@@ -2393,6 +2413,7 @@ const function compileTuple(...)
 	local totalSize = 0
 	local allFixed = true
 	local costly = false
+	local sideChannel = false
 	local minBytes, minBits, minRefs = 0, 0, 0
 
 	for i = 1, n do
@@ -2408,6 +2429,9 @@ const function compileTuple(...)
 			totalSize += t.size
 		else
 			allFixed = false
+		end
+		if t._sideChannel ~= false then
+			sideChannel = true
 		end
 		const tb, tbits, trefs = minWire(t)
 		minBytes += tb
@@ -2544,6 +2568,7 @@ const function compileTuple(...)
 		}
 	end
 	compiled._kind = "tuple"
+	compiled._sideChannel = sideChannel
 	compiled._types = fieldTypes
 	compiled._minBytes = minBytes
 	compiled._minBits = minBits
@@ -2565,6 +2590,7 @@ const function compileVec3i16(scale: number?)
 	const limit = 32767 / s
 	const compiled = {
 		size = 6,
+		_sideChannel = false,
 		check = function(v)
 			if _typeof(v) ~= "Vector3" then
 				return false, "expected Vector3, got " .. _typeof(v)
@@ -2626,6 +2652,7 @@ const function compileVec2i16(scale: number?)
 	const limit = 32767 / s
 	const compiled = {
 		size = 4,
+		_sideChannel = false,
 		check = function(v)
 			if _typeof(v) ~= "Vector2" then
 				return false, "expected Vector2, got " .. _typeof(v)
@@ -2949,6 +2976,7 @@ end
 
 types.auto = {
 	_costly = true,
+	_sideChannel = true,
 	sizeOf = sizeOfAuto,
 	check = checkAuto,
 	write = writeAuto,

@@ -113,7 +113,7 @@ The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes:
 - `:FireClientsStreamed(at, range, ...)` / `:FireClientsStreamedWithExclusion(at, range, exclude, ...)` — server → players whose HumanoidRootPart is within `range` of `at`
 - `.OnReceived` — Signal fired with `(player, ...payload)` on the server and `(...payload)` on the client. `.OnServerEvent` and `.OnClientEvent` are the same signal under other names.
 
-**Client events buffer until someone listens.** Fires arriving before the first handler connects are queued, then drained on the next defer to whatever is connected at that moment. After that the queue is gone for good and fires with no handler are dropped, as they always are on the server. A `:Once` or `:Wait` as the first listener takes the oldest buffered fire and the rest of the backlog is dropped.
+**Client events buffer until someone listens.** Fires arriving before the first handler connects are queued, then drained oldest first on the next defer, for as long as a handler is connected. A `:Once` or `:Wait` that takes one fire and leaves hands the rest to the next connection instead of dropping them. Once the backlog is empty the queue is gone for good and fires with no handler are dropped, as they always are on the server. The queue holds at most 256 fires; past that new ones are dropped, with one warning naming the event.
 
 ### Funcs
 
@@ -125,7 +125,7 @@ The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes:
 | `Returns`   | compiled type                     | required | Schema for the response payload.               |
 | `Timeout`   | `number?`                         | `7`     | Seconds to wait for response before erroring. `math.huge` or `0` waits forever. |
 | `ValidateOutgoing` | `boolean?`                 | `IS_STUDIO` | Check args and returns against their schemas before send. |
-| `RateLimit` | `{calls: number, per: number}?`   | nil     | Server-side gate on incoming invokes.          |
+| `RateLimit` | `{calls: number, per: number}?`   | nil     | Server-side gate on incoming invokes; a refused invoke errors on the client at once. |
 | `ValidateAcceptNonFinite` | `boolean?` | nil | Overrides `VALIDATE_DEFAULT_REJECT_NON_FINITE` for this func, requests and responses alike. |
 
 **Methods:**
@@ -134,14 +134,17 @@ The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes:
 - `:SetCallback(fn)` — set on whichever side *answers*. Both sides may set one, since either can be invoked: the server's callback receives `(player, ...args) -> ...returns`, the client's receives `(...args) -> ...returns` with no player argument.
 - `:SetServerCallback(fn)` / `:SetClientCallback(fn)` — the same, but raise if called on the wrong side.
 
-**Every func works in both directions.** Each frame carries a u16 word whose top bit says request or response, leaving a 15-bit request id. That is what lets both directions be in flight on the same func at once without their ids colliding — 32,767 outstanding per side. Funcs are always reliable.
+**Every func works in both directions.** Each frame carries a u16 word whose top bit says request or response, and on a response the next bit marks an error, leaving a 14-bit request id. That is what lets both directions be in flight on the same func at once without their ids colliding — 16,384 outstanding per func per side. Ids still waiting on a response are skipped when minting, so a wrapped id never overwrites one in flight, and invoking with every id in use raises. Funcs are always reliable.
 
 **Invoking a client is hostile ground**, because the client decides whether an answer ever comes back. Three things make it survivable, and they are load-bearing rather than polish:
 - `:InvokeClient` **requires a finite positive `Timeout`** and raises without one, since an untimed invoke would park a server thread and leak its pending entry for as long as the server runs. `:InvokeServer` carries no such requirement, so an untimed func stays legal as long as nothing invokes a client with it.
 - Each player may hold at most `MAX_PENDING_PER_PLAYER` outstanding invokes; past that `:InvokeClient` raises rather than letting one stalling client accumulate server threads.
+- The other way round, the server runs at most `MAX_CALLBACKS_PER_PLAYER` callbacks for one player at a time, across every func. Requests past that are refused like a rate limit and the invoke errors on the client, so a client can't pile up yielding callbacks.
 - A response is only accepted from the player the request was sent to, so one player cannot answer another's invoke. A player leaving fails their pending invokes immediately instead of making the server wait out the timeout.
 
-A client with no callback, or whose callback errors, simply lets the invoke time out. There is no distinct error response on the wire; the second free reqid bit is where one would go.
+Callbacks run on a recycled thread rather than inside the receive loop, so one that yields holds up neither the rest of its batch nor the batches behind it.
+
+**A side that can't answer says so.** It sends an error response, the request id with the error bit set and a u8 reason code in place of the returns, and the invoke raises at once with the reason: the callback errored, no callback is set (warned once per func on the answering side), the request was refused by a rate limit or the callback cap, or the returned value could not be sent. Only a side that never answers leaves the invoke to its timeout. A callback's own error text stays in the output of the side that ran it; only the code crosses the wire.
 
 ### Signal
 
@@ -160,7 +163,7 @@ Handlers run on a recycled runner thread, newest connection first.
 
 ### Validation
 
-With `VALIDATE_INCOMING_TYPES` on, which is the default on the server, the codec swaps in strict readers when BitNet initializes. A machine with it off keeps the lean readers and pays nothing. A frame that fails is rejected: the rest of that batch is dropped, a warning names the endpoint, sender, field path and reason, and `OnRejected` fires. Frames earlier in the same batch were already delivered.
+With `VALIDATE_INCOMING_TYPES` on, which is the default on the server, the codec swaps in strict readers when BitNet initializes. A machine with it off keeps the lean readers and pays nothing. A frame that fails is rejected: a warning names the endpoint, sender, field path and reason, and `OnRejected` fires. Frames earlier in the same batch were already delivered. Most failures also drop the rest of the batch, since nothing after them can be read reliably. A non-finite value drops only its own frame, because that frame still decodes to its end, and the batch carries on after it, up to 16 such frames a batch.
 
 What strict decoding enforces:
 - **Nothing is allocated from a bare count.** Every array, map, string, buffer, `auto` array or map and `compress` length is checked against what the sender actually sent before anything is created, using the element's cheapest encoding per channel. Ref-only elements get 1,024 spare refs per batch, for Instances that arrive as nil; zero-size elements share 1,024 per batch.
@@ -177,16 +180,19 @@ This checks types and bounds, not meaning. Whether an id exists, whether an Inst
 
 - **Framing.** Each fire writes `[id][payload]` into a bin. `runtime.registry` mints IDs sequentially in registration order, up to 65,535. Under 255 endpoints they are one byte, otherwise varint. The format locks on first network use, so everything must register before any fire.
 - **Batching.** All fires within one Heartbeat coalesce into one RemoteEvent fire per (channel, target), over two shared remotes. On the server a bin joins a dirty list when its cursor leaves 0; the client checks its two global bins directly.
+- **Player bins.** Made on PlayerAdded, or by the first fire, invoke or response to a player who has none yet. Roblox runs the newest PlayerAdded handler first, so a game's own handler usually fires to a new player before BitNet's has run; that fire makes the bins rather than being dropped. A player who is leaving never gets new bins.
+- **Bins shrink back.** One that grew past `DEFAULT_BIN_SIZE` drops back after 64 sends in a row that each used under a quarter of it, to twice the largest of those sends, so one large burst isn't held for the session. It happens right after a send, when the bin is empty, so nothing is copied; a bin still at its default size pays one comparison per send.
 - **Three channels per send.** The main buffer is argument 1, the refs array argument 2, the packed boolean buffer argument 3.
 - **Refs channel.** Instances and `ref` values ride as real Lua values and take no bytes in the main buffer. Writers append in order, readers consume in the same order, counted by `refCount`. Nil is stored as `false` so the array never has holes; an `instance` can't be `false`, while a falsy `ref` spends one boolean-channel bit telling nil from false.
-- **Player ids.** `runtime.players` hands out ids 1-255 round robin (0 is nil) on PlayerAdded, or on first write if a handler beat it there, publishes them as the `PLAYER_ID_ATTRIBUTE` attribute and frees them on PlayerRemoving. Clients mirror the map from the attribute, so a client writing a player whose attribute hasn't replicated yet raises.
+- **Player ids.** `runtime.players` hands out ids 1-255 round robin (0 is nil) on PlayerAdded, or on first write if a handler beat it there, publishes them as the `PLAYER_ID_ATTRIBUTE` attribute and frees them 5 seconds after PlayerRemoving, on both sides, so frames about a player who just left (a PlayerLeft broadcast, or anything still in flight) still resolve. A leaving player is never handed a fresh id, which would never be freed. Clients mirror the map from the attribute, so a client writing a player whose attribute hasn't replicated yet raises.
 - **Tuple fast path.** Events whose `Args` is a tuple of 2 to 6 values fire and receive them as plain arguments, with no packed table on either side. Larger tuples pack into a table. Funcs always pack.
 - **Dispatch.** Every entry exposes one prebuilt `_handle(buf, cursor, context, player)`; `runtime.dispatch` just calls it, with one pcall per batch.
 - **Streamed fires.** Validated and encoded once into a scratch bin, then copied into each nearby player's bin.
 - **Unreliable chunking.** Combined main, boolean and ref payloads exceeding `MAX_UNRELIABLE_BYTES` split on fire boundaries into multiple sends. Refs count against the cap at `UNRELIABLE_REF_BYTES` each, and each chunk carries only its own refs. A single fire over the cap is dropped with a warning.
 - **Boolean channel.** Booleans, `optional` presence flags and the `numbersequence` selector pack eight to a byte through a rolling sentinel, without `buffer.writebits`. Packed bytes stay Lua numbers while batching and are written into one exact-size buffer at send time.
-- **Reliable bins pack bits across fires; unreliable bins do not.** On a reliable bin the sentinel runs continuously through the whole batch and the last partial byte is packed once, in `dispatch.sendBin`, so twenty frames carrying one boolean each cost 3 bytes rather than 20. Unreliable bins flush per fire, because chunk splits slice the boolean buffer by byte index and so must land on a byte boundary; streamed fires force a boundary for the same reason. The reader mirrors this with a `resetBools` flag on `dispatch.processBatch`, true only for unreliable batches.
+- **Reliable bins pack bits across fires; unreliable bins do not.** On a reliable bin the sentinel runs continuously through the whole batch and the last partial byte is packed once, in `dispatch.sendBin`, so twenty frames carrying one boolean each cost 3 bytes rather than 20. Unreliable bins flush per fire, because chunk splits slice the boolean buffer by byte index and so must land on a byte boundary. A streamed fire packs its bits once in the scratch bin; an unreliable bin takes them as whole bytes, while a reliable bin splices them onto its partial byte with `Bin.pushBits`, because its reader never realigns between frames and a padded byte would shift every frame after it. The reader mirrors this with a `resetBools` flag on `dispatch.processBatch`, true only for unreliable batches.
 - **Codec context.** Every read/write receives the active bin state: `refs`, `refCount`, `bools`, `amount` and `value`. `amount` counts completed boolean bytes, `value` is the rolling sentinel holding the partial byte and its bit count. `Bin.flushBools` packs the sentinel into `bools[]` and empties it. Because a reliable sentinel may hold bits from earlier frames, `Bin.tryWrite` captures it on entry and restores it on retry. Outgoing state is reused per bin; incoming batches own independent state, so yielding handlers cannot interfere.
+- **Failed writes roll back.** A write that raises partway never advances the cursor, but it may already have pushed bits and refs. Plain writes whose schema can touch the bool or ref channels (every compiled type carries `_sideChannel`) record that state and their start cursor on the bin (`safe*`) first; the next write, or `sendBin`, that finds the cursor still there calls `Bin.recover` to drop the leftovers, since on a reliable bin they would shift every frame after them. Schemas that can't touch either channel skip the record, since their failure leaves nothing behind, which makes a `u16` fire 9% cheaper and a `(u16, vec3)` fire 5%; every writer still checks for a record left by an earlier failure. Costly writes roll back inside `Bin.tryWrite`, which only retries `out of bounds`, so a value that can never encode fails at once instead of growing the bin.
 - **Sizing.** Fixed-size schemas carry `size`, variable ones carry `sizeOf`. Schemas whose `sizeOf` has to walk the payload (map, `auto`, arrays of variable elements, anything containing them) are flagged `_costly` and write optimistically through `Bin.tryWrite`, growing and retrying, instead of being sized first.
 - **Length prefixes.** Shared varint helpers at the top of `codec`, used by string, buffer, array and `auto`; call sites inline the one-byte case. Map counts are backfilled after the entries, so they use a padded two-byte varint.
 - **Hybrid encodings.** `numbersequence` spends one boolean-channel bit choosing between a compact form (Time u16/65535, Value and Envelope u8/255, 4 bytes a keypoint) and a full form (three f32, 12 bytes). Compact requires every Value and Envelope in 0..1 and strictly increasing quantised times, since `NumberSequence.new` rejects duplicates. The write fetches `v.Keypoints` once and decides while writing, because that property rebuilds a Lua table on every access.
@@ -214,7 +220,8 @@ Keys the init config accepts, with their defaults from `constants`.
 | `MAX_UNRELIABLE_BYTES`  | 1,000   | Combined main + boolean + ref unreliable chunk cap. |
 | `UNRELIABLE_REF_BYTES`  | 8       | Assumed wire cost of one ref, for that cap.      |
 | `DEFAULT_FUNC_TIMEOUT`  | 7       | Default `Timeout` for funcs.                     |
-| `MAX_PENDING_PER_PLAYER`| 32      | Outstanding `:InvokeClient` calls allowed per player. |
+| `MAX_PENDING_PER_PLAYER`| 32      | Max invokes the server sent a player that await an answer; `:InvokeClient` raises past it. |
+| `MAX_CALLBACKS_PER_PLAYER` | 32 | Max invokes a player sent the server that are still running; requests past it are refused and the invoke errors on the client. |
 | `VALIDATE_OUTGOING_TYPES` | IS_STUDIO | Default `ValidateOutgoing` for events and funcs. |
 | `DEFAULT_BIN_SIZE`      | 256     | Starting bin buffer size in bytes.               |
 | `BIN_GROWTH_FACTOR`     | 2       | Buffer grow multiplier on overflow.              |

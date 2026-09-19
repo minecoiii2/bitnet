@@ -24,6 +24,7 @@ const globalUnreliable = newBin("unreliable", nil)
 
 const playersReliable: {[Player]: any} = {}
 const playersUnreliable: {[Player]: any} = {}
+const gone = setmetatable({} :: { [Player]: boolean }, { __mode = "k" })
 
 const dirtyList = {}
 local dirtyCount = 0
@@ -56,11 +57,28 @@ const function setRemotes(reliable, unreliable)
 	end
 end
 
+const function playerAdded(player: Player)
+	if playersReliable[player] then
+		return
+	end
+	playersReliable[player] = newBin("reliable", player)
+	playersUnreliable[player] = newBin("unreliable", player)
+end
+
+const function binFor(player: Player, reliable: boolean)
+	if gone[player] or player.Parent ~= Players then
+		return nil
+	end
+	playerAdded(player)
+	return if reliable then playersReliable[player] else playersUnreliable[player]
+end
+
 const module = {
 	globalReliable = globalReliable,
 	globalUnreliable = globalUnreliable,
 	playersReliable = playersReliable,
 	playersUnreliable = playersUnreliable,
+	binFor = binFor,
 	markDirty = markDirty,
 	getDirty = getDirty,
 	clearDirty = clearDirty,
@@ -68,16 +86,12 @@ const module = {
 }
 
 if IS_SERVER then
-	const function playerAdded(player: Player)
-		playersReliable[player] = newBin("reliable", player)
-		playersUnreliable[player] = newBin("unreliable", player)
-	end
-
 	for _, player in Players:GetPlayers() do
 		playerAdded(player)
 	end
 	Players.PlayerAdded:Connect(playerAdded)
 	Players.PlayerRemoving:Connect(function(player)
+		gone[player] = true
 		const r = playersReliable[player]
 		const u = playersUnreliable[player]
 		if r then r._removed = true end

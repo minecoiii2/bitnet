@@ -58,7 +58,7 @@ const compress = BitNetTypes.compress
 const RemoteEvent = BitNet.event
 const RemoteFunction = BitNet.func
 
--- X number of calls during every X number of seconds
+-- X number of calls during X amount of seconds
 const function BuildRatelimit(calls: number, perSecond: number)
 	return {calls = calls, per = perSecond}
 end
