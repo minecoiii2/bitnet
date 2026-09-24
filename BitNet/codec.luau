@@ -275,6 +275,34 @@ primitives.u24 = {
 		return c
 	end,
 }
+primitives.u48 = {
+	size = 6,
+	check = checkUint(48),
+	write = function(b, c, v)
+		buf_writeu32(b, c, bit_band(v, 4294967295))
+		buf_writeu16(b, c + 4, v // 4294967296)
+		return c + 6
+	end,
+	read = function(b, c)
+		return buf_readu32(b, c) + buf_readu16(b, c + 4) * 4294967296, c + 6
+	end,
+	_writeMany = function(b, c, value, len)
+		for i = 1, len do
+			const v = value[i]
+			buf_writeu32(b, c, bit_band(v, 4294967295))
+			buf_writeu16(b, c + 4, v // 4294967296)
+			c += 6
+		end
+		return c
+	end,
+	_readMany = function(b, c, out, len)
+		for i = 1, len do
+			out[i] = buf_readu32(b, c) + buf_readu16(b, c + 4) * 4294967296
+			c += 6
+		end
+		return c
+	end,
+}
 
 primitives.i8 = {
 	size = 1,
@@ -360,6 +388,34 @@ primitives.i24 = {
 		for i = 1, len do
 			out[i] = buf_readu16(b, c) + buf_readi8(b, c + 2) * 65536
 			c += 3
+		end
+		return c
+	end,
+}
+primitives.i48 = {
+	size = 6,
+	check = checkInt(48),
+	write = function(b, c, v)
+		buf_writeu32(b, c, bit_band(v, 4294967295))
+		buf_writei16(b, c + 4, v // 4294967296)
+		return c + 6
+	end,
+	read = function(b, c)
+		return buf_readu32(b, c) + buf_readi16(b, c + 4) * 4294967296, c + 6
+	end,
+	_writeMany = function(b, c, value, len)
+		for i = 1, len do
+			const v = value[i]
+			buf_writeu32(b, c, bit_band(v, 4294967295))
+			buf_writei16(b, c + 4, v // 4294967296)
+			c += 6
+		end
+		return c
+	end,
+	_readMany = function(b, c, out, len)
+		for i = 1, len do
+			out[i] = buf_readu32(b, c) + buf_readi16(b, c + 4) * 4294967296
+			c += 6
 		end
 		return c
 	end,

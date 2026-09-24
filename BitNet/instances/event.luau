@@ -14,6 +14,7 @@ const constants = require(script.Parent.Parent.constants)
 const codec = require(script.Parent.Parent.codec)
 const assertAt = require(script.Parent.Parent.libs.assertAt)
 const getNearbyPlayers = require(script.Parent.Parent.libs.getNearbyPlayers)
+const Debug = require(script.Parent.Parent.runtime.debug)
 
 const Bin_reserve = Bin.reserve
 const Bin_tryWrite = Bin.tryWrite
@@ -121,6 +122,7 @@ end
 --   options.Reliable  -- defaults to true
 --   options.RateLimit -- server-side gate
 --   options.ValidateOutgoing -- check values against the schema before send (default: constants.VALIDATE_OUTGOING_TYPES)
+--   options.Debug     -- print every send and receive (default: constants.DEBUG)
 function module.new(options: {
 	Args: any,
 	Reliable: boolean?,
@@ -131,7 +133,8 @@ function module.new(options: {
 })
 	assertAt(type(options) == 'table', "bitnet.event: options expected a table")
 	
-	const debugEnabled = options.Debug == true
+	const printing = if options.Debug == nil then constants.DEBUG == true else options.Debug == true
+	const hooked = printing or Debug.enabled
 	const schema = options.Args
 	const reliable = options.Reliable ~= false
 	assertAt(options.Typecheck == nil, "bitnet.event: options.Typecheck is now ValidateOutgoing", 2)
@@ -147,7 +150,7 @@ function module.new(options: {
 	const self = {
 		kind = "event",
 		id = 0,
-		debugEnabled = debugEnabled,
+		debugEnabled = printing,
 		schema = schema,
 		reliable = reliable,
 		isTuple = isTuple,
@@ -390,6 +393,24 @@ function module.new(options: {
 		end
 	end
 
+	-- debug wraps the write instead of adding a check to it, so with debug off the path is untouched
+	local streamWritten = false
+	if hooked then
+		const write = writeFrame
+		writeFrame = function(bin, v1, v2, v3, v4, v5, v6)
+			const before = bin.cursor
+			write(bin, v1, v2, v3, v4, v5, v6)
+			-- an unreliable fire over the cap leaves the cursor where it was, since it was dropped
+			const written = bin.cursor ~= before
+			if bin == scratch then
+				streamWritten = written
+			elseif written then
+				const values = if packed then v1 else { v1, v2, v3, v4, v5, v6 }
+				Debug.sent(self, printing, "fire", bin._target, table_unpack(values, 1, if isTuple then arity else 1))
+			end
+		end
+	end
+
 	const function validate(...)
 		if not isTuple and select('#', ...) > 1 then
 			error(`bitnet.event #{id} outgoing validation failed: too many values`, 3)
@@ -458,7 +479,7 @@ function module.new(options: {
 			end
 		end
 
-		const function streamFrame(players: { Player }, exclude: Player?, ...)
+		local function streamFrame(players: { Player }, exclude: Player?, ...)
 			resetScratch()
 			if packed then
 				writeFrame(scratch, {...})
@@ -475,6 +496,24 @@ function module.new(options: {
 				end
 			end
 			resetScratch()
+		end
+
+		-- reported once here with its recipients; the scratch write it makes isn't
+		if hooked then
+			const stream = streamFrame
+			streamFrame = function(players: { Player }, exclude: Player?, ...)
+				streamWritten = false
+				stream(players, exclude, ...)
+				if streamWritten then
+					const reached = {}
+					for _, player in players do
+						if player ~= exclude then
+							table.insert(reached, player)
+						end
+					end
+					Debug.sent(self, printing, "fire", reached, ...)
+				end
+			end
 		end
 
 		function self:FireClientsStreamed(at: Vector3, streamingRange: number, ...)
@@ -587,6 +626,10 @@ function module.new(options: {
 			sig:Fire(value)
 			return nextCursor
 		end
+	end
+
+	if hooked then
+		Debug.watch(sig, self, printing)
 	end
 
 	return self

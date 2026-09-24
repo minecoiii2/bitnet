@@ -10,10 +10,12 @@ export type BitnetTypes = {
 	u16: number,
 	u24: number,
 	u32: number,
+	u48: number,
 	i8: number,
 	i16: number,
 	i24: number,
 	i32: number,
+	i48: number,
 	f24: number,
 	f32: number,
 	f64: number,
@@ -98,6 +100,8 @@ export type Config = {
 	MAX_PENDING_PER_PLAYER: number?,
 	MAX_CALLBACKS_PER_PLAYER: number?,
 
+	DEBUG: boolean?,
+
 	VALIDATE_OUTGOING_TYPES: boolean?,
 	VALIDATE_INCOMING_TYPES: boolean?,
 	VALIDATE_DEFAULT_REJECT_NON_FINITE: boolean?,
@@ -119,6 +123,7 @@ export type Bitnet = {
 		ValidateOutgoing: boolean?,
 		RateLimit: { calls: number, per: number }?,
 		ValidateAcceptNonFinite: boolean?,
+		Debug: boolean?,
 	}) -> ServerEvent<A...>,
 	
 	func: <A..., R...>(config: {
@@ -128,6 +133,7 @@ export type Bitnet = {
 		ValidateOutgoing: boolean?,
 		RateLimit: { calls: number, per: number }?,
 		ValidateAcceptNonFinite: boolean?,
+		Debug: boolean?,
 	}) -> ServerFunction<A..., R...>,
 
 	signal: <T...>() -> signal.Signal<T...>,
@@ -135,6 +141,10 @@ export type Bitnet = {
 	-- signals
 	
 	OnRejected: signal.Signal<Player?, number?, string>,
+
+	-- only present with DEBUG on: (endpoint, action, player, ...payload)
+	EventSent: signal.Signal<any, string, any, ...any>?,
+	EventReceived: signal.Signal<any, string, any, ...any>?,
 }
 
 return nil

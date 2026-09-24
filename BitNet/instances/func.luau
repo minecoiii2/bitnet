@@ -11,6 +11,7 @@ const registry = require(script.Parent.Parent.runtime.registry)
 const constants = require(script.Parent.Parent.constants)
 const codec = require(script.Parent.Parent.codec)
 const assertAt = require(script.Parent.Parent.libs.assertAt)
+const Debug = require(script.Parent.Parent.runtime.debug)
 
 const Bin_reserve = Bin.reserve
 const Bin_tryWrite = Bin.tryWrite
@@ -85,6 +86,7 @@ const module = {}
 --   options.Timeout   -- seconds to wait for response (default: constants.DEFAULT_FUNC_TIMEOUT)
 --   options.ValidateOutgoing -- check values against the schema before send (default: constants.VALIDATE_OUTGOING_TYPES)
 --   options.RateLimit -- server-side gate
+--   options.Debug     -- print every request, response and error sent or received (default: constants.DEBUG)
 function module.new(options: {
 	Args: any,
 	Returns: any,
@@ -92,10 +94,13 @@ function module.new(options: {
 	ValidateOutgoing: boolean?,
 	RateLimit: { calls: number, per: number }?,
 	ValidateAcceptNonFinite: boolean?,
+	Debug: boolean?,
 })
 	const args = options.Args
 	const returns = options.Returns
 	const typecheck = if options.ValidateOutgoing == nil then constants.VALIDATE_OUTGOING_TYPES else options.ValidateOutgoing
+	const printing = if options.Debug == nil then constants.DEBUG == true else options.Debug == true
+	const hooked = printing or Debug.enabled
 
 	assertAt(args, "bitnet.func: options.Args is required", 2)
 	assertAt(args.write and args.read,
@@ -239,6 +244,31 @@ function module.new(options: {
 		bin.cursor = at + 1
 	end
 
+	const function spreadArgs(value)
+		if isTuple then
+			return table_unpack(value, 1, argsArity)
+		end
+		return value
+	end
+
+	const function spreadReturns(value)
+		if returnsIsTuple then
+			return table_unpack(value, 1, returnsArity)
+		end
+		return value
+	end
+
+	-- Debug hooks are wrappers picked at creation, and only at calls Luau wouldn't inline anyway (the
+	-- invoke methods, pcall, spawnCallback), so with debug off each is the plain function; wrapping a
+	-- call it does inline measured about 20 ns slower even with debug off
+	const writeRequest = if hooked
+		then function(bin, word: number, schema, costly: boolean, marked: boolean, value, hint: number): number
+			const nextHint = writeFrame(bin, word, schema, costly, marked, value, hint)
+			Debug.sent(self, printing, "request", bin._target, spreadArgs(value))
+			return nextHint
+		end
+		else writeFrame
+
 	const function takeReqId(): number
 		for _ = 1, REQID_SPACE do
 			const reqid = nextReqId
@@ -283,7 +313,7 @@ function module.new(options: {
 		end
 
 		const reqid = takeReqId()
-		argsHint = writeFrame(binaries.globalReliable, reqid + REQUEST_FLAG, args, argsCostly, argsMarked, value, argsHint)
+		argsHint = writeRequest(binaries.globalReliable, reqid + REQUEST_FLAG, args, argsCostly, argsMarked, value, argsHint)
 
 		const thread = coroutine.running()
 		pending[reqid] = thread
@@ -337,7 +367,7 @@ function module.new(options: {
 		if bin.cursor == 0 then
 			markDirty(bin)
 		end
-		argsHint = writeFrame(bin, reqid + REQUEST_FLAG, args, argsCostly, argsMarked, value, argsHint)
+		argsHint = writeRequest(bin, reqid + REQUEST_FLAG, args, argsCostly, argsMarked, value, argsHint)
 
 		const thread = coroutine.running()
 		pending[reqid] = { thread = thread, player = player }
@@ -398,6 +428,20 @@ function module.new(options: {
 		end
 	end
 
+	const respond = if hooked
+		then function(reqid: number, response, player: Player?)
+			sendResponse(reqid, response, player)
+			Debug.sent(self, printing, "response", player, spreadReturns(response))
+		end
+		else sendResponse
+
+	const fail = if hooked
+		then function(reqid: number, code: number, player: Player?)
+			sendError(reqid, code, player)
+			Debug.sent(self, printing, "error", player, ERROR_REASONS[code])
+		end
+		else sendError
+
 	const function runCallback(callback, value, player: Player?)
 		if returnsIsTuple then
 			local results
@@ -447,26 +491,26 @@ function module.new(options: {
 				warnedNoCallback = true
 				warn(`bitnet.func #{id} has no callback on this side, so every invoke of it here fails`)
 			end
-			sendError(reqid, NO_CALLBACK, player)
+			fail(reqid, NO_CALLBACK, player)
 			return
 		end
 		const ok, response = runCallback(callback, value, player)
 		if not ok then
-			sendError(reqid, CALLBACK_ERRORED, player)
+			fail(reqid, CALLBACK_ERRORED, player)
 			return
 		end
 		if typecheck then
 			const vok, verr = returns.check(response)
 			if not vok then
 				warn(`bitnet.func #{id} returns outgoing validation failed: {verr}`)
-				sendError(reqid, BAD_RESPONSE, player)
+				fail(reqid, BAD_RESPONSE, player)
 				return
 			end
 		end
-		const sent, err = pcall(sendResponse, reqid, response, player)
+		const sent, err = pcall(respond, reqid, response, player)
 		if not sent then
 			warn(`bitnet.func #{id} could not send its response: {tostring(err)}`)
-			sendError(reqid, BAD_RESPONSE, player)
+			fail(reqid, BAD_RESPONSE, player)
 		end
 	end
 
@@ -482,7 +526,16 @@ function module.new(options: {
 			end
 		end
 
+		-- _handle calls this directly and Luau inlines it, so debug is a check on a flag fixed at creation
+		-- rather than a wrapper, which would stop the inlining
 		const function settle(reqid: number, player: Player, ok: boolean, result)
+			if hooked then
+				if ok then
+					Debug.received(self, printing, "response", player, spreadReturns(result))
+				else
+					Debug.received(self, printing, "error", player, result)
+				end
+			end
 			const entry = pending[reqid]
 			if entry and entry.player == player then
 				pending[reqid] = nil
@@ -490,6 +543,22 @@ function module.new(options: {
 				task.spawn(entry.thread, ok, result)
 			end
 		end
+
+		const onRequest = if hooked
+			then function(value, reqid: number, player: Player)
+				Debug.received(self, printing, "request", player, spreadArgs(value))
+				answerPlayer(value, reqid, player)
+			end
+			else answerPlayer
+
+		const refuse = if hooked
+			then function(value, reqid: number, player: Player)
+				Debug.received(self, printing, "request", player, spreadArgs(value))
+				fail(reqid, REFUSED, player)
+			end
+			else function(_, reqid: number, player: Player)
+				sendError(reqid, REFUSED, player)
+			end
 
 		self._handle = function(buf, cursor, context, player)
 			const word = buf_readu16(buf, cursor)
@@ -501,11 +570,11 @@ function module.new(options: {
 				const value, nextCursor = args.read(buf, cursor + 2, context)
 				const inFlight = running[player] or 0
 				if (rateLimited and not rateLimitAllowed(self, player)) or inFlight >= MAX_CALLBACKS then
-					sendError(reqid, REFUSED, player)
+					refuse(value, reqid, player)
 					return nextCursor
 				end
 				running[player] = inFlight + 1
-				spawnCallback(answerPlayer, value, reqid, player)
+				spawnCallback(onRequest, value, reqid, player)
 				return nextCursor
 			end
 			if word >= ERROR_FLAG then
@@ -529,6 +598,13 @@ function module.new(options: {
 		end)
 	else
 		const function settle(reqid: number, ok: boolean, result)
+			if hooked then
+				if ok then
+					Debug.received(self, printing, "response", nil, spreadReturns(result))
+				else
+					Debug.received(self, printing, "error", nil, result)
+				end
+			end
 			const thread = pending[reqid]
 			if thread then
 				pending[reqid] = nil
@@ -536,11 +612,18 @@ function module.new(options: {
 			end
 		end
 
+		const onRequest = if hooked
+			then function(value, reqid: number)
+				Debug.received(self, printing, "request", nil, spreadArgs(value))
+				answer(value, reqid, nil)
+			end
+			else answer
+
 		self._handle = function(buf, cursor, context)
 			const word = buf_readu16(buf, cursor)
 			if word >= REQUEST_FLAG then
 				const value, nextCursor = args.read(buf, cursor + 2, context)
-				spawnCallback(answer, value, word - REQUEST_FLAG, nil)
+				spawnCallback(onRequest, value, word - REQUEST_FLAG, nil)
 				return nextCursor
 			end
 			if word >= ERROR_FLAG then

@@ -77,7 +77,7 @@ return {
 				compress(array(
 					struct({
 						Sender = player,
-						At = u32,
+						At = u48,
 						Message = string,
 						WasFiltered = bool,
 					})
@@ -120,8 +120,8 @@ Networking.Chat.Send:FireServer("hello", 1)
 
 | Type | Bytes | Notes |
 | ---- | ----- | ----- |
-| `u8` `u16` `u24` `u32` | 1–4 | Unsigned integers |
-| `i8` `i16` `i24` `i32` | 1–4 | Signed integers |
+| `u8` `u16` `u24` `u32` `u48` | 1–6 | Unsigned integers |
+| `i8` `i16` `i24` `i32` `i48` | 1–6 | Signed integers |
 | `f24` `f32` `f64` | 3, 4, 8 | `number` is `f64` |
 | `bool` | 1 bit | Packed |
 | `string` `buffer` | 1–5 + length | |
@@ -137,7 +137,7 @@ Networking.Chat.Send:FireServer("hello", 1)
 | `auto` | 1 + value | Picks an encoding at runtime |
 | `nothing` | 0 | Always nil |
 
-The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) save bytes but cost a bit of CPU. In the Networking template, `any` is `ref`.
+The narrow types (`u24`, `i24`, `f24`, `u48`, `i48`, `vec*i16`, `cframe`) save bytes but cost a bit of CPU. In the Networking template, `any` is `ref`.
 
 **Combinators**
 - `struct(format)`: table with fixed keys

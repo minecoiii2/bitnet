@@ -1,7 +1,7 @@
 --!native
 --!optimize 2
 
--- VERSION 3.2.0
+-- VERSION 3.3.0
 
 const IS_STUDIO = game:GetService("RunService"):IsStudio()
 
@@ -34,6 +34,7 @@ return function(config: {[string]: any}): types.Bitnet
 	const func = require(script.instances.func)
 	const signal = require(script.instances.signal)
 	const dispatch = require(script.runtime.dispatch)
+	const Debug = require(script.runtime.debug)
 
 	const bitnet = {
 		types = codec.types,
@@ -43,6 +44,8 @@ return function(config: {[string]: any}): types.Bitnet
 		signal = signal.new,
 
 		OnRejected = dispatch.OnRejected,
+		EventSent = Debug.EventSent,
+		EventReceived = Debug.EventReceived,
 	}
 	cache = bitnet
 	

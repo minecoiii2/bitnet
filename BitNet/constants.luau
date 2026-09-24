@@ -7,6 +7,8 @@ return {
 	MAX_PENDING_PER_PLAYER = 32, -- max invokes the server sent a player that await an answer
 	MAX_CALLBACKS_PER_PLAYER = 32, -- max invokes a player sent the server that are still running
 
+	DEBUG = false, -- default Debug for every event and func; also creates BitNet.EventSent and EventReceived
+
 	VALIDATE_OUTGOING_TYPES = true and IS_STUDIO, -- check values against their schema before sending
 	VALIDATE_INCOMING_TYPES = IS_SERVER, -- decode incoming frames strictly and reject malformed ones
 	VALIDATE_DEFAULT_REJECT_NON_FINITE = true, -- reject NaN and inf

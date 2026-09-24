@@ -6,7 +6,7 @@
 Buffer-based networking library for Roblox. Replaces RemoteEvent/RemoteFunction with batched, type-checked wire frames over two shared remotes, using a main buffer plus refs and packed-boolean side channels.
 
 ## Module layout
-ReplicatedStorage.BitNet              -- main module, returns init(config?) -> { types, event, func, signal, OnRejected }
+ReplicatedStorage.BitNet              -- main module, returns init(config?) -> { types, event, func, signal, OnRejected, EventSent?, EventReceived? }
 ├── codec                             -- type primitives + combinators, strict readers, rejection locator
 ├── bin                               -- per-bin buffer, refs and boolean state; grow/retry, bool packing, snapshots
 ├── binaries                          -- global + per-player bins, dirty tracking
@@ -19,6 +19,7 @@ ReplicatedStorage.BitNet              -- main module, returns init(config?) -> {
 │   ├── registry                      -- sequential id minting, frame headers, rate limiting
 │   ├── remotes                       -- BitnetReliable + BitnetUnreliable
 │   ├── players                       -- u8 player ids for types.player, published as an attribute
+│   ├── debug                         -- Debug prints and the EventSent/EventReceived signals
 │   └── dispatch                      -- Heartbeat send loop + receive parser
 ├── libs/
 │   ├── hash                          -- FNV-1a u32
@@ -55,13 +56,15 @@ The table init returns:
 | `func(opts)` | Creates a new function. Returns a `ServerFunction<A..., R...>`.             |
 | `signal()`   | Creates a standalone Signal (local pub-sub, not networked).                 |
 | `OnRejected` | Signal fired `(player?, id?, reason)` when a validating receiver rejects incoming data. |
+| `EventSent`  | Only with `DEBUG` on. Signal fired `(endpoint, action, player, ...payload)` for everything this machine sends. See Debugging. |
+| `EventReceived` | Only with `DEBUG` on. The same for everything this machine receives. |
 
 ### Types
 
 | Type | Bytes | Notes |
 | ---- | ----- | ----- |
-| `u8` `u16` `u24` `u32` | 1 2 3 4 | Unsigned integers. |
-| `i8` `i16` `i24` `i32` | 1 2 3 4 | Signed integers. |
+| `u8` `u16` `u24` `u32` `u48` | 1 2 3 4 6 | Unsigned integers. `u48` reaches 281474976710655, which covers every Roblox id; `f64` holds those exactly too, so it is a two byte saving, not a precision one. |
+| `i8` `i16` `i24` `i32` `i48` | 1 2 3 4 6 | Signed integers. `i48` spans ±140737488355327. |
 | `f24` `f32` `f64` | 3 4 8 | `f24` is an f32 with the low 8 mantissa bits dropped, by truncation, so its relative error reaches 3e-5 and is biased toward zero. `number` aliases `f64`. |
 | `bool` | 0 | One bit in the boolean side channel. |
 | `string` `buffer` | 1-5 + len | Varint byte-length prefix: one byte through 127, five through the u32 max. |
@@ -81,7 +84,7 @@ The table init returns:
 | `player` | 1 | The player's u8 id, which the server assigns and publishes as an attribute. Nil, or a player who has left, reads as nil. `auto` still sends Players as refs. |
 | `auto` | 1 + payload | Tagged dynamic value, see Gotchas. |
 
-The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes: buffer reads and writes cost the same at every width, so narrowing only ever adds work. Reach for them when bandwidth is the binding constraint, not by default.
+The narrow types (`u24`, `u48`, `i24`, `i48`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes: buffer reads and writes cost the same at every width, so narrowing only ever adds work. Reach for them when bandwidth is the binding constraint, not by default.
 
 **Combinators:**
 - `struct(format)` — keyed table. Fields are hash-sorted, so source order does not matter.
@@ -105,6 +108,7 @@ The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes:
 | `ValidateOutgoing` | `boolean?`                 | `IS_STUDIO` | Check values against the schema before send. |
 | `RateLimit` | `{calls: number, per: number}?`   | nil     | Server-side gate on incoming client fires.     |
 | `ValidateAcceptNonFinite` | `boolean?` | nil | Overrides `VALIDATE_DEFAULT_REJECT_NON_FINITE` for this event. |
+| `Debug`     | `boolean?`                        | `DEBUG` | Print every send and receive of this event. |
 
 **Methods:**
 - `:FireServer(...)` — client → server
@@ -127,6 +131,7 @@ The narrow types (`u24`, `i24`, `f24`, `vec*i16`, `cframe`) trade CPU for bytes:
 | `ValidateOutgoing` | `boolean?`                 | `IS_STUDIO` | Check args and returns against their schemas before send. |
 | `RateLimit` | `{calls: number, per: number}?`   | nil     | Server-side gate on incoming invokes; a refused invoke errors on the client at once. |
 | `ValidateAcceptNonFinite` | `boolean?` | nil | Overrides `VALIDATE_DEFAULT_REJECT_NON_FINITE` for this func, requests and responses alike. |
+| `Debug`     | `boolean?`                        | `DEBUG` | Print every request, response and error this func sends or receives. |
 
 **Methods:**
 - `:InvokeServer(...)` — called on the client. Yields until the response or the timeout; raises on either failure.
@@ -160,6 +165,16 @@ Callbacks run on a recycled thread rather than inside the receive loop, so one t
 Connection: `.Connected`, `:Disconnect()`, `:Reconnect()`, `:Destroy()`. Only `:Destroy()` is final.
 
 Handlers run on a recycled runner thread, newest connection first.
+
+### Debugging
+
+- `Debug = true` on an event or func prints every send and receive of it, e.g. `[BitNet] event #12 fire -> Player1: 5, true` or `[BitNet] func #3 response <- server: 42`. It defaults to the `DEBUG` config key, so `DEBUG = true` prints everything and `Debug = false` quiets one noisy endpoint.
+- `DEBUG = true` also creates `BitNet.EventSent` and `BitNet.EventReceived`, which see every send and receive on that machine whatever each endpoint's `Debug` is, for a top-down view of the traffic. Both fire `(endpoint, action, player, ...payload)`:
+  - `endpoint` is the event or func object; `.kind` is `"event"` or `"func"` and `.id` its frame id.
+  - `action` is `"fire"` for events and `"request"`, `"response"` or `"error"` for funcs. An error's payload is its reason.
+  - `player` is the Player sent to or received from. On the server a send to `nil` went to every client and a streamed fire passes its recipients as a list; on the client it is always `nil`, meaning the server.
+  - A send is reported once it is written, so a write that raises or an unreliable fire dropped for size never is. A receive is reported as it's delivered, before the handlers run; a fire refused by a rate limit is not, while a refused invoke is, followed by its error.
+- With both off it costs nothing. An endpoint wraps its send and receive functions at creation, and only when debug applies to it, so no per-fire check exists. The one exception is a func response arriving, which checks a flag fixed at creation (about 1 ns): wrapping that call instead stops Luau inlining it, which measured about 20 ns slower even with debug off. `EventSent` and `EventReceived` are nil with `DEBUG` off.
 
 ### Validation
 
@@ -222,6 +237,7 @@ Keys the init config accepts, with their defaults from `constants`.
 | `DEFAULT_FUNC_TIMEOUT`  | 7       | Default `Timeout` for funcs.                     |
 | `MAX_PENDING_PER_PLAYER`| 32      | Max invokes the server sent a player that await an answer; `:InvokeClient` raises past it. |
 | `MAX_CALLBACKS_PER_PLAYER` | 32 | Max invokes a player sent the server that are still running; requests past it are refused and the invoke errors on the client. |
+| `DEBUG`                 | false   | Default `Debug` for every event and func; also creates `EventSent` and `EventReceived`. |
 | `VALIDATE_OUTGOING_TYPES` | IS_STUDIO | Default `ValidateOutgoing` for events and funcs. |
 | `DEFAULT_BIN_SIZE`      | 256     | Starting bin buffer size in bytes.               |
 | `BIN_GROWTH_FACTOR`     | 2       | Buffer grow multiplier on overflow.              |
